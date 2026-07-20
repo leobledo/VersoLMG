@@ -1081,7 +1081,7 @@ function _extBase(){
     return decodeURI(p);
   }catch(e){ return ''; }
 }
-function probeHost(cb){ if(!csInterface){ cb(false); return; } csInterface.evalScript('(typeof importLyricsToComp==="function")?"1":"0"', function(r){ cb(r==='1'); }); }
+function probeHost(cb){ if(!csInterface){ cb(false); return; } csInterface.evalScript('(typeof importLyricsToComp==="function" && typeof _hostVersion==="function")?"1":"0"', function(r){ cb(r==='1'); }); }
 function loadHostViaXHR(done){
   if(_hostSrc){ csInterface.evalScript(_hostSrc, function(){ done(); }); return; }
   try{
@@ -1637,7 +1637,7 @@ function togglePlay(){
     else toast('This channel has no audio — load one first');
     return;
   }
-  if(AEL.paused) AEL.play(); else AEL.pause();
+  if(AEL.paused){ var _pp=AEL.play(); if(_pp&&_pp['catch']) _pp['catch'](function(err){ toast('No se pudo reproducir: '+((err&&err.name)||err)); }); } else AEL.pause();
 }
 function toggleRateMenu(ev){
   if(ev) ev.stopPropagation();
@@ -1679,9 +1679,11 @@ function loadMultiAudio(inp){
   var files=Array.prototype.slice.call(inp.files||[]); inp.value='';
   if(!files.length) return;
   files.sort(function(a,b){ return (a.lastModified||0)-(b.lastModified||0); });
-  var n=Math.min(files.length, channels.length);
+  // Reparte desde el canal ACTIVO hacia abajo (misma logica que en AE).
+  var from=0; for(var q=0;q<channels.length;q++){ if(channels[q].id===activeId){ from=q; break; } }
+  var n=Math.min(files.length, channels.length-from);
   for(var i=0;i<n;i++){
-    var ch=channels[i], f=files[i];
+    var ch=channels[from+i], f=files[i];
     if(ch.audioURL){ try{ URL.revokeObjectURL(ch.audioURL); }catch(e){} }
     ch.audioFile=f; ch.audioURL=URL.createObjectURL(f); ch.audioName=f.name; ch.audioDur=0;
     var meta=parseAudioMeta(f.name);                       // fill Artist / Song from the file name
@@ -1743,15 +1745,108 @@ function thumbnailAll(){
   });
 }
 // SRT batch — load .srt files and apply them to the Lyrics comps (selected or all). AE-only.
+// Recupera el resultado que ExtendScript volco al temporal. Se pide con una segunda
+// llamada CORTA: al no abrir dialogos, evalScript si devuelve el valor (el de la
+// llamada original se pierde por el dialogo modal).
+function _readResultFile(cb){
+  if(!IN_AE||!csInterface){ cb(null); return; }
+  try{ csInterface.evalScript('_readResultText()', function(t){ cb(t||null); }); }
+  catch(e){ cb(null); }
+}
+
+// Llama a una funcion del host que ABRE UN DIALOGO. CEP pierde el valor de retorno en
+// ese caso, asi que si llega vacio se recupera del volcado temporal con una 2a llamada
+// corta (sin dialogo), que si retorna. cb(null) solo si de verdad no hubo nada.
+// El host EMPUJA su resultado con CSXSEvent (mecanismo estandar de CEP). Es fiable
+// aunque evalScript pierda el valor de retorno por culpa del dialogo modal.
+var _dlgPending=null;
+function _initHostEvents(){
+  if(!csInterface || _initHostEvents.done) return;
+  _initHostEvents.done=true;
+  try{
+    csInterface.addEventListener('com.leobledo.verso.result', function(ev){
+      var data = ev && (ev.data!=null ? ev.data : (ev.detail||null));
+      if(_dlgPending && data){ var f=_dlgPending; _dlgPending=null; f(String(data)); }
+    });
+  }catch(e){}
+}
+// El host vuelca el resultado a un archivo DENTRO de la carpeta de la extension (junto a
+// jsx/host.jsx). El panel lo lee con un XHR RELATIVO — el mismo origen con el que ya carga
+// jsx/host.jsx — asi la lectura SIEMPRE esta permitida y ademas NO pasa por el motor de
+// ExtendScript, que queda BLOQUEADO mientras el dialogo modal esta abierto. Antes, si el
+// retorno de evalScript se perdia por el dialogo, la accion se quedaba SIN ninguna leyenda.
+var _RESULT_FILE='verso_result.json';          // relativo a index.html
+function _resultDirFS(){
+  var b='';
+  try{ b=_extBase(); }catch(e){}               // carpeta de index.html = base del XHR relativo
+  if(!b){ try{ b=csInterface.getSystemPath(SystemPath.EXTENSION); }catch(e2){} }
+  b=String(b||''); var SEP=String.fromCharCode(92);
+  while(b.length && (b.charAt(b.length-1)==='/' || b.charAt(b.length-1)===SEP)) b=b.slice(0,-1);
+  return b;
+}
+function _readResultRel(cb){
+  try{
+    var xhr=new XMLHttpRequest(); xhr.open('GET', _RESULT_FILE+'?ts='+Date.now(), true);
+    xhr.onreadystatechange=function(){ if(xhr.readyState!==4) return;
+      var t=(xhr.responseText||'').replace(/^\uFEFF/,'').replace(/\s+$/,'');
+      cb((t && t.charAt(0)==='{' && t.charAt(t.length-1)==='}')?t:null);
+    };
+    xhr.onerror=function(){ cb(null); };
+    xhr.send();
+  }catch(e){ cb(null); }
+}
+function _evalDlg(script, cb){
+  if(!csInterface){ cb(null); return; }
+  _initHostEvents();
+  var done=false, tries=0, timer=null;
+  function finish(v){ if(done) return; done=true; _dlgPending=null; if(timer) clearInterval(timer); cb(v); }
+  function tryReads(){
+    if(done) return;
+    _readResultRel(function(t){ if(t) finish(t); });                                     // XHR relativo (no se bloquea con el modal)
+    try{ csInterface.evalScript('(typeof _readResultText===\"function\")?_readResultText():\"\"', function(t){ if(t && String(t).indexOf('{')!==-1) finish(t); }); }catch(e){}
+  }
+  _dlgPending=finish;                          // via evento CSXS (respaldo)
+  // Fija el directorio de volcado DENTRO de la extension y limpia el resultado anterior, en
+  // UNA llamada corta no-modal (asi el XHR relativo nunca lee un resultado de una accion vieja).
+  var setup='(function(){try{'
+    +'if(typeof _setResultDir===\"function\")_setResultDir('+JSON.stringify(_resultDirFS())+');'
+    +'if(typeof _clearResult===\"function\")_clearResult();'
+    +'return \"1\";}catch(e){return \"0\";}})()';
+  csInterface.evalScript(setup, function(){
+    csInterface.evalScript(script, function(raw){
+      if(raw && String(raw).indexOf('{')!==-1){ finish(raw); return; }                   // el motor devolvio el JSON directo
+      // Este callback llega cuando la funcion (y su dialogo modal) YA termino: el motor esta
+      // libre, asi que leer el volcado AHORA es fiable aunque el retorno viniera vacio.
+      var n=0; (function drain(){ if(done) return; tryReads(); if(++n<25) setTimeout(drain, 150); })();
+    });
+    // Respaldo por temporizador (por si el callback de arriba no llega en algun AE).
+    timer=setInterval(function(){
+      if(done) return;
+      if(++tries>240){ finish(null); return; }
+      tryReads();
+    }, 300);
+  });
+}
+// Parseo tolerante: JSON.parse(null) devuelve null SIN lanzar, y luego r.ok reventaba
+// dentro del callback dejando la accion SIN ninguna leyenda. Aqui siempre hay mensaje.
+function _parseRes(txt, label){
+  var r=null;
+  try{ r=JSON.parse(txt); }catch(e){ r=null; }
+  if(r && typeof r==="object") return r;
+  toast(label+': '+(txt?('respuesta inesperada -> '+String(txt).slice(0,120)):'sin respuesta de AE (reabre el panel)'), 8000);
+  return null;
+}
+// Import SRT: usa el dialogo de After Effects (como antes). La leyenda muestra SOLO el
+// nombre del archivo importado; si el resultado no vuelve, no se pone leyenda (sin bloqueo).
 function srtBatchAction(){
-  if(!csInterface){ toast('Only inside After Effects'); return; }
-  toast('Loading SRT…');
+  if(!csInterface){ toast('Solo dentro de After Effects'); return; }
   ensureHost(function(ok){
-    if(!ok){ toast('Could not connect to the AE host'); return; }
-    csInterface.evalScript('importSRTBatch('+_M()+')', function(raw){
-      var r=null; try{ r=JSON.parse(raw); }catch(e){ toast('SRT: '+(raw||'no response')); return; }
-      if(!r.ok){ toast('SRT: '+(r.msg||'error')); return; }
-      toast('✓ SRT applied to '+r.applied+'/'+r.total+' comps · '+r.layers+' layers');
+    if(!ok){ toast('No se pudo conectar con AE'); return; }
+    _evalDlg('importSRTBatch('+_M()+')', function(txt){
+      var r=null; try{ r=JSON.parse(txt); }catch(e){}
+      if(r && r.ok && r.files && r.files.length){
+        toast('✓ '+r.files.slice(0,4).join(', ')+(r.files.length>4?(' +'+(r.files.length-4)):''), 6000);
+      }
     });
   });
 }
@@ -1789,11 +1884,11 @@ function bulkImportAction(){
           return;
         }
         var j=jobs[i++];
-        csInterface.evalScript('bulkImportOne('+JSON.stringify(j.lyr)+','+JSON.stringify(j.srt)+','+JSON.stringify(opt)+')', function(raw){
+        csInterface.evalScript('bulkImportOne('+JSON.stringify(j.lyr)+','+JSON.stringify(_srtSafe(j.srt))+','+JSON.stringify(opt)+')', function(raw){
           raw=raw||'';
           if(raw.indexOf('ok:')===0) okc++;
           else if(raw.indexOf('skip:')===0) skip++;
-          else { fail++; if(!firstErr) firstErr=(raw.indexOf('err:')===0?raw.slice(4):raw)||'no response'; }
+          else { fail++; if(!firstErr) firstErr=(raw.indexOf('err:')===0?raw.slice(4):raw)||'sin respuesta de AE'; }
           toast('Bulk '+i+'/'+jobs.length+'…');
           next();
         });
@@ -1939,7 +2034,7 @@ function importStyleController(){
     compWidth:1920, compHeight:1080, compFps:30, compDuration:60
   };
   toast('Importing to comp…');
-  csInterface.evalScript('importViaStyleController('+JSON.stringify(srt)+','+JSON.stringify(JSON.stringify(opt))+')', function(result){
+  csInterface.evalScript('importViaStyleController('+JSON.stringify(_srtSafe(srt))+','+JSON.stringify(JSON.stringify(opt))+')', function(result){
     if(!result||result==='undefined'){ toast('No response from AE — check Script Debug Console'); return; }
     if(result.indexOf('ok:')===0){ toast('✓ '+result.slice(3)); }
     else { var msg=result.indexOf('err:')===0?result.slice(4):result; toast('AE error: '+msg); }
@@ -1975,8 +2070,28 @@ function _songReadJsx(ch){
   '}catch(e){return "ERR:"+e.toString();}})()';
 }
 // Apply a channel's loaded-song title (from the file name). overwrite=true replaces it.
+// Construye una URL file:// valida en Windows y macOS. Las rutas de Mac suelen llevar
+// espacios y acentos: sin escapar, el <audio> no carga y el play no hacia nada.
+// Deja el SRT ASCII-safe ANTES de cruzar el puente de CEP: con caracteres no-ASCII
+// evalScript puede devolver vacio y el panel mostraba "No response". Tambien evita
+// que AE sustituya la fuente en esos glifos.
+function _srtSafe(s){
+  return String(s==null?"":s)
+    .replace(/[\u2018\u2019\u201A\u201B\u02BC\u2032]/g, "'")
+    .replace(/[\u201C\u201D\u201E\u201F\u2033]/g, '"')
+    .replace(/[\u2010\u2011\u2012\u2013\u2014\u2015]/g, '-')
+    .replace(/\u2026/g, '...')
+    .replace(/[\u00A0\u2007\u2009\u200A\u202F]/g, ' ')
+    .replace(/[\u200B\u200C\u200D\u200E\u200F\uFEFF]/g, '');
+}
+function _fileURL(p){
+  var cp=String(p||'').replace(/\\/g,'/');
+  if(cp.charAt(0)!=='/') cp='/'+cp;            // Windows: /C:/... ; Mac ya empieza con /
+  var enc=cp; try{ enc=encodeURI(cp); }catch(e){}
+  return 'file://'+enc.replace(/#/g,'%23').replace(/\?/g,'%3F');
+}
 function _applySongTitle(ch, path, overwrite){
-  var cp=path.replace(/\\/g,'/'); ch.audioURL='file://'+(cp[0]==='/'?cp:'/'+cp); ch.audioName=ch.songName||'';
+  ch.audioURL=_fileURL(path); ch.audioName=ch.songName||'';
   var base=path.split(/[\\\/]/).pop(), meta=parseAudioMeta(base), changed=false;
   if(meta.artist && (overwrite || !(ch.artist&&ch.artist.trim()))){ ch.artist=meta.artist; changed=true; }
   if(meta.song   && (overwrite || !(ch.song&&ch.song.trim()))){     ch.song=meta.song;     changed=true; }
@@ -2034,16 +2149,19 @@ function refreshAllTitles(doneCb, silent){
 // On web/touch the ♪ button just loads an audio file; Master is AE-only.
 function masterAction(ev){
   if(ev) ev.stopPropagation();
-  if(!csInterface){ openAudio(); return; }
+  // web: selector MULTIPLE (antes abria el de 1 solo archivo y no dejaba cargar varias)
+  if(!csInterface){ masterMulti(); return; }
   toast('Master…');
   ensureHost(function(ok){
     if(!ok){ toast('Could not connect to the AE host'); return; }
-    csInterface.evalScript('masterRun('+_M()+')', function(raw){
-      var r=null; try{ r=JSON.parse(raw); }catch(e){ toast('Master: '+(raw||'no response')); return; }
-      if(!r.ok){ toast('Master: '+(r.msg||r.step||'error')); return; }
-      toast('✓ Audio '+r.replaced+'/'+r.total+' · Lyrics '+r.lyricsCleaned+'/'+r.lyricsTotal+' · Ranges '+r.rangeUpdated+'/'+r.rangeTotal);
-      // Clear all SRT layers (separate call so it never risks breaking the song replacement).
-      csInterface.evalScript('clearAllLyricLayers('+_M()+')', function(){});
+    _evalDlg('masterRun('+_M()+')', function(txt){
+      var r=_parseRes(txt, 'Master'); if(!r) return;
+      if(!r.ok){ toast('Master: '+(r.msg==='Cancelled'?'carga cancelada':(r.msg||r.step||'error')), 5000); return; }
+      _masterDone(r);
+      function _masterDone(r){
+      var _mn=(r.songs&&r.songs.length)?r.songs.map(function(s){return (s.name||'').replace(/\.[^.]+$/,'');}).filter(Boolean):[];
+      var _md=_mn.length?(' · '+_mn.slice(0,3).join(', ')+(_mn.length>3?(' +'+(_mn.length-3)):'')):'';
+      toast('✓ Canciones '+r.replaced+'/'+r.total+_md+' · SRT borrados '+(r.srtRemoved!=null?r.srtRemoved:0)+' · Rangos '+r.rangeUpdated+'/'+r.rangeTotal, 7000);
       // Apply new song paths returned directly by masterRun (no second evalScript round-trip needed).
       if(r.songs && r.songs.length){
         var applied=0;
@@ -2061,6 +2179,7 @@ function masterAction(ev){
       } else {
         aeRefreshAfterMaster(); // fallback if songs array not in response
       }
+      }   // fin _masterDone
     });
   });
 }
@@ -2073,9 +2192,9 @@ function renderAction(ev){
   toast('Render…');
   ensureHost(function(ok){
     if(!ok){ toast('Could not connect to the AE host'); return; }
-    csInterface.evalScript('renderRun('+_M()+')', function(raw){
-      var r=null; try{ r=JSON.parse(raw); }catch(e){ toast('Render: '+(raw||'no response')); return; }
-      if(!r.ok){ toast('Render: '+r.msg); return; }
+    _evalDlg('renderRun('+_M()+')', function(txt){
+      var r=_parseRes(txt, 'Render'); if(!r) return;
+      if(!r.ok){ toast('Render: '+(r.msg||'error'), 6000); return; }
       var m='✓ '+r.added+' to Render Queue (TH '+r.thCount+' · Main '+r.mainCount+')';
       if(r.tmplWarning) m+=' ⚠ '+r.tmplWarning;
       toast(m);
@@ -2091,8 +2210,8 @@ function thumbnailAction(id){
   ensureHost(function(ok){
     if(!ok){ toast('Could not connect to the AE host'); return; }
     csInterface.evalScript('updateThumbnailComp('+JSON.stringify(chTh(ch))+','+JSON.stringify(ch.artist||'')+','+JSON.stringify(ch.song||'')+')', function(r){
-      if(r&&r.indexOf('ok:')===0){ toast('✓ Thumbnail: '+r.slice(3)); loadThumbPreview(ch); }
-      else { toast('TH: '+(r&&r.indexOf('err:')===0?r.slice(4):(r||'no response'))); }
+      if(r&&r.indexOf('ok:')===0){ toast('✓ Miniatura actualizada · '+r.slice(3), 5000); loadThumbPreview(ch); }
+      else { toast('Miniatura: '+(r&&r.indexOf('err:')===0?r.slice(4):(r||'sin respuesta de AE')), 7000); }
     });
   });
 }
@@ -2109,7 +2228,7 @@ function loadThumbPreview(ch){
       var r=null; try{ r=JSON.parse(raw); }catch(e){}
       if(!r||!r.ok||!r.path) return;
       var img=ch._thumbImg; if(!img) return;
-      img.src='file:///'+String(r.path).replace(/\\/g,'/');   // unique filename per render → no cache-bust needed
+      img.src=_fileURL(r.path);   // unique filename per render → no cache-bust needed
       img.style.display='block';
     });
   });
@@ -2141,7 +2260,7 @@ function importToChannel(){
   toast('Importing to '+chLyr(ch)+'…');
   ensureHost(function(ok){
     if(!ok){ toast('Could not connect to the AE host'); return; }
-    csInterface.evalScript('importLyricsToComp('+JSON.stringify(chLyr(ch))+','+JSON.stringify(srt)+','+JSON.stringify(JSON.stringify(opt))+')', function(result){
+    csInterface.evalScript('importLyricsToComp('+JSON.stringify(chLyr(ch))+','+JSON.stringify(_srtSafe(srt))+','+JSON.stringify(JSON.stringify(opt))+')', function(result){
       if(!result||result==='undefined'){ toast('No response from AE'); return; }
       if(result.indexOf('ok:')===0){ toast('✓ '+result.slice(3)+' → siguiente canal', 1600); setTimeout(advanceToNextChannel, 550); }
       else { toast('AE: '+(result.indexOf('err:')===0?result.slice(4):result)); }
