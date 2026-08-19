@@ -669,9 +669,13 @@ tlWrap.addEventListener('mousedown', function(e){
 });
 tlWrap.addEventListener('wheel', function(e){
   if(!dur) return; e.preventDefault();
-  if(e.altKey){
+  // Zoom con Alt/Option (Win+Mac), o Ctrl (incl. pinch de trackpad en Mac, que llega como
+  // ctrl+wheel), o Cmd. Sin modificador = scroll. deltaY continuo -> paso proporcional.
+  if(e.altKey || e.ctrlKey || e.metaKey){
     var r=tlTrack.getBoundingClientRect(), mx=(e.clientX-r.left)/r.width, tp=scrollPct+mx/zoom;
-    zoomTarget=Math.max(1,Math.min(40,(tlEaseId?zoomTarget:zoom)+(e.deltaY>0?-1:1)));
+    // -deltaY*0.01: rueda (~±100/notch) da ±1; trackpad (delta pequeno) da pasos suaves.
+    // deltaY>0 (abajo) = alejar; deltaY<0 (arriba) = acercar.
+    zoomTarget=Math.max(1,Math.min(40,(tlEaseId?zoomTarget:zoom) - e.deltaY*0.01));
     scrollTarget=Math.max(0,Math.min(1-1/zoomTarget, tp-mx/zoomTarget)); startTlEase();
   } else { var step=(e.deltaY||e.deltaX)*.0016/zoom; scrollTarget=clampScroll((tlEaseId?scrollTarget:scrollPct)+step); startTlEase(); }
 },{passive:false});
@@ -1512,24 +1516,25 @@ function updateLyricHighlight(t){
     var st=stamps[k].time, ln=(stamps[k].len!=null)?stamps[k].len:((k+1<stamps.length)?(stamps[k+1].time-st):(dur?dur-st:3)), en=st+Math.max(0.05,ln);
     if(t>=st && t<en){ activeLi=stamps[k].lineIdx; break; }
   }
-  var nextLi=nextStampable(curLine);   // linea a marcar cuando no hay activa por reproduccion
-  var hi = (activeLi>=0) ? activeLi : nextLi;   // UNA sola linea "actual": semibold + blanca
-  // Indice por linea -> stamp (una pasada), evita el bucle interno O(n²) por cada nodo.
+  var nextLi=nextStampable(curLine);   // linea a marcar (pista tenue, NO "activa")
+  // ACTIVA = solo la linea cuyo marcador cubre el tiempo actual. En huecos entre marcadores
+  // NO hay activa (esa parte queda inactiva/vacia, como antes). nextLi es una pista tenue
+  // y NUNCA mueve la letra ni se pinta como activa (por eso no "salta" al ajustar marcadores).
   var byLine={}; for(var q=0;q<stamps.length;q++){ if(byLine[stamps[q].lineIdx]===undefined) byLine[stamps[q].lineIdx]=q; }
   var flow=document.getElementById('lyrFlow'), nodes=flow.children, centerNode=null;
   for(var n=0;n<nodes.length;n++){
     var el=nodes[n]; if(el.classList.contains('section')) continue;
     var li=+el.dataset.i, si=(byLine[li]===undefined?-1:byLine[li]);
     var state;
-    if(li===hi){ state='active'; centerNode=el; }
+    if(li===activeLi){ state='active'; centerNode=el; }               // solo la activa centra
     else if(si>=0){ var s2=stamps[si].time, l2=(stamps[si].len!=null)?stamps[si].len:((si+1<stamps.length)?(stamps[si+1].time-s2):(dur?dur-s2:3)), e2=s2+Math.max(0.05,l2); state=(t>=e2)?'past':'future'; }
+    else if(li===nextLi){ state='next'; }                            // pista tenue, sin centrar
     else state='future';
     // Solo escribe el DOM si el estado cambio (clave = estado). Gran ahorro por frame en Mac.
-    var sk=state;
-    if(el._sk!==sk){
-      el._sk=sk;
+    if(el._sk!==state){
+      el._sk=state;
       var lk=el.firstChild;
-      if(lk) lk.style.color = state==='active'?'rgba(255,255,255,.98)':state==='past'?'rgba(255,255,255,.5)':'rgba(255,255,255,.26)';
+      if(lk) lk.style.color = state==='active'?'rgba(255,255,255,.98)':state==='next'?'rgba(255,255,255,.5)':state==='past'?'rgba(255,255,255,.5)':'rgba(255,255,255,.26)';
       el.style.fontWeight = (state==='active') ? '600' : '400';
     }
   }
@@ -1800,39 +1805,38 @@ function dlText(text, name){
   var a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=fn; document.body.appendChild(a); a.click();
   setTimeout(function(){ document.body.removeChild(a); URL.revokeObjectURL(a.href); }, 1500);
 }
-// Export inteligente (web): si hay un canal ABIERTO/activo, descarga solo ese; si no hay
-// ninguno seleccionado, exporta TODOS de a uno cada 0.5s (para conservar el orden en AE).
+// Numero de canal: el de AE si existe, si no la posicion en el panel (1-based).
+function _channelNum(ch){ if(ch&&ch.num!=null) return ch.num; var i=channels.indexOf(ch); return i>=0?(i+1):null; }
+// Nombre del SRT = "NN Artist - Song" (sin ft/feat en el Song). El "NN" al inicio deja que
+// AE lo importe en la Lyrics 01 / Short Lyrics 01, etc., por nomenclatura (no por hora).
+function _srtName(ch){
+  var n=_channelNum(ch), pad = (n!=null) ? (n<10?('0'+n):(''+n)) : '';
+  var r=_splitFeat(ch.artist||'', ch.song||''), a=r.artist, s=r.song;
+  var base = (a&&s) ? (a+' - '+s) : (s||a||ch.name||'subtitles');
+  return (pad?pad+' ':'')+base;
+}
+// Export inteligente (web): canal ABIERTO/activo -> solo ese; ninguno -> TODOS de golpe.
+// El orden lo lleva el nombre "NN …", no el tiempo de exportacion.
 function exportSmart(){
   if(expandedId!==null) exportOne(getActive());
-  else exportAllSequential();
+  else exportAll();
 }
 function exportOne(ch){
   if(!ch){ toast('No channel'); return; }
   saveWorkingSet();
   var lpb=1, lpbEl=document.getElementById('lpb'); if(lpbEl) lpb=parseInt(lpbEl.value)||1;
   var srt=buildSRTFor(ch, lpb); if(!srt.trim()){ toast('Este canal no tiene timestamps'); return; }
-  dlText(srt, ch.song||ch.name);
-  toast('✓ SRT exportado: '+(ch.song||ch.name));
+  dlText(srt, _srtName(ch));
+  toast('✓ SRT exportado: '+_srtName(ch));
 }
-// Uno por uno, con 0.5s entre cada descarga: los navegadores reordenan las descargas
-// simultaneas, y el retardo conserva el orden (01, 02, 03…) para importarlos luego en AE.
-function exportAllSequential(){
+// Todos de una sola vez, nombrados "NN Artist - Song". El numero manda el orden en AE.
+function exportAll(){
   saveWorkingSet();
   var lpb=1, lpbEl=document.getElementById('lpb'); if(lpbEl) lpb=parseInt(lpbEl.value)||1;
-  var list=[];
-  channels.forEach(function(c){ var srt=buildSRTFor(c, lpb); if(srt.trim()) list.push({ srt:srt, name:c.song||c.name }); });
-  if(!list.length){ toast('No hay canales terminados para exportar'); return; }
-  startProgress(list.length*550);
-  var i=0;
-  (function step(){
-    if(i>=list.length){ stopProgress(); toast('✓ Exportados '+list.length+' SRT (en orden)'); return; }
-    setProgress((i+1)/list.length);
-    dlText(list[i].srt, list[i].name); i++;
-    setTimeout(step, 500);
-  })();
+  var n=0;
+  channels.forEach(function(c){ var srt=buildSRTFor(c, lpb); if(!srt.trim()) return; dlText(srt, _srtName(c)); n++; });
+  toast(n?('✓ Exportados '+n+' SRT (por numeracion)'):'No hay canales terminados para exportar');
 }
-// Compatibilidad: el "Export all" antiguo ahora respeta el orden con retardo.
-function exportAll(){ exportAllSequential(); }
 // AE: update ALL thumbnails at once (Artist/Song of every "… TH" comp).
 function thumbnailAll(){
   if(!csInterface){ toast('Only inside After Effects'); return; }

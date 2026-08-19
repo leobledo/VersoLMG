@@ -1184,12 +1184,28 @@ function adjustRangeComp(comp) {
     if (lyr.hasAudio && lyr.source instanceof FootageItem) { audioLayer = lyr; break; }
   }
   if (!audioLayer) return false;
+
+  // 1) Asegurar que la Song este COMPLETA. Tras reemplazar el audio, el outPoint de la capa
+  //    queda al largo de la cancion ANTERIOR (la corta si la nueva es mas larga). Se fija el
+  //    outPoint al final REAL del audio (considerando time-stretch), extendiendo o recortando.
+  try {
+    var stretch = audioLayer.stretch ? Math.abs(audioLayer.stretch) : 100;
+    var fullEnd = audioLayer.startTime + audioLayer.source.duration * (100 / stretch);
+    if (Math.abs(fullEnd - audioLayer.outPoint) > 0.001) audioLayer.outPoint = fullEnd;
+  } catch (eX) {}
+
+  // 2) La comp debe abarcar el final del audio (si la cancion es mas larga que la comp).
+  var audioEnd = audioLayer.outPoint;
+  try { if (audioEnd + 0.5 > comp.duration) comp.duration = audioEnd + 0.5; } catch (eD) {}
+
+  // 3) Work area = del inicio del audio a su final (ya completo).
   var waStart = Math.max(0, audioLayer.inPoint);
   var waEnd = Math.min(audioLayer.outPoint, comp.duration);
   if (waEnd <= waStart) return false;
   comp.workAreaStart = waStart;
   comp.workAreaDuration = waEnd - waStart;
-  var audioEnd = audioLayer.outPoint;
+
+  // 4) Mover el Outro al final del audio.
   for (var j = 1; j <= comp.numLayers; j++) {
     if (comp.layer(j).name === OUTRO_NAME) {
       var outro = comp.layer(j);
@@ -2303,19 +2319,27 @@ function importSRTBatch(isShort) {
     }
 
     app.beginUndoGroup('Lyricator: Import SRT batch');
-    var count = Math.min(targets.length, files.length);
-    // Lista PLANA en el ORDEN exacto: por canal, primero "01 NN Lyrics" (video) y luego
-    // "01 NN Short Lyrics"; cada canal usa el MISMO archivo para ambas. Procesada de forma
-    // secuencial (una comp a la vez) para que no se empalme ni se salten pasos.
+    // Empareja cada .srt con su Lyrics por el NUMERO al inicio del nombre del archivo:
+    // "01 Artist - Song.srt" -> Lyrics 01 (+ Short Lyrics 01). Asi el orden lo manda la
+    // nomenclatura, no la hora de exportacion. Si un archivo no trae numero, se usa el orden.
+    var byNum = {}, bn, tln;
+    for (bn = 0; bn < videoLyr.length; bn++) { tln = _leadNum(videoLyr[bn].name); if (tln != null) byNum[tln] = videoLyr[bn]; }
+    var allow = {}; for (bn = 0; bn < targets.length; bn++) { var an = _leadNum(targets[bn].name); if (an != null) allow[an] = true; }
+    var onlySel = (sel.length > 0);
     var jobs = [], j, jc, applied = 0, shortApplied = 0, totalLayers = 0, firstComp = null, missed = [];
-    for (j = 0; j < count; j++) {
-      jobs.push({ comp: targets[j], file: files[j], kind: 'video' });
+    for (j = 0; j < files.length; j++) {
+      var fnum = _leadNum(files[j].name), vcomp = null;
+      if (fnum != null && byNum[fnum] && (!onlySel || allow[fnum])) vcomp = byNum[fnum];   // por numero
+      else if (j < targets.length && fnum == null) vcomp = targets[j];                     // respaldo por orden (solo si no hay numero)
+      if (!vcomp) { missed.push('"' + files[j].name + '" sin Lyrics destino'); continue; }
+      jobs.push({ comp: vcomp, file: files[j], kind: 'video' });
       if (isShort) {
-        var tw = _shortTwinByName(targets[j]);
+        var tw = _shortTwinByName(vcomp);
         if (tw) jobs.push({ comp: tw, file: files[j], kind: 'short' });
-        else missed.push('sin Short Lyrics para "' + targets[j].name + '"');
+        else missed.push('sin Short Lyrics para "' + vcomp.name + '"');
       }
     }
+    var count = files.length;
     for (jc = 0; jc < jobs.length; jc++) {
       var job = jobs[jc];
       var content = _readFile(job.file);
