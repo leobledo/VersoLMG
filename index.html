@@ -98,9 +98,9 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 .lyr-stage.grabbing{cursor:grabbing}
 .lyr-flow{position:absolute;left:0;right:0;top:0;text-align:center;padding:46% 30px;transition:transform .55s cubic-bezier(.22,.61,.36,1);will-change:transform}
 .lyr-flow.nodrift{transition:none}
-.lyr-line{font-size:19.5px;font-weight:500;line-height:1.7;cursor:pointer;text-align:center}
+.lyr-line{font-size:19.5px;font-weight:400;line-height:1.7;cursor:pointer;text-align:center}
 .lyr-line:hover .lk{filter:brightness(1.3)}
-.lk{display:inline-block;color:rgba(255,255,255,.28);transition:color .3s ease}   /* karaoke fill driven per-frame via background-clip:text */
+.lk{display:inline-block;color:rgba(255,255,255,.25);transition:color .3s ease,font-weight .15s ease}
 .lyr-line.section{font-size:14px;font-weight:700;text-transform:uppercase;letter-spacing:.14em;cursor:default;margin-top:.85em;margin-bottom:.15em}   /* breathing room between section blocks */
 .lyr-flow .lyr-line.section:first-child{margin-top:0}
 .lyr-line.section .lk{color:rgba(255,255,255,.3)}
@@ -589,6 +589,7 @@ if (window.__adobe_cep__ && typeof CSInterface !== 'undefined') {
   try { csInterface = new CSInterface(); } catch(e){ csInterface = null; }
 }
 var IN_AE = !!csInterface;   // single source of truth for "running inside After Effects"
+var IS_MAC = (navigator.platform||'').toLowerCase().indexOf('mac')>=0 || /mac/i.test(navigator.userAgent||'');
 // Touch device = iPad / iPhone (web on a touch screen). AE/desktop-web use the mouse.
 var IS_TOUCH = (('ontouchstart' in window) || (navigator.maxTouchPoints||0) > 0) && !IN_AE;
 try{
@@ -649,6 +650,28 @@ AEL.addEventListener('loadedmetadata', function(){ var a=getActive(); dur=AEL.du
 window.addEventListener('keydown', onKey, true);   // capture: interceptar antes que nada
 window.addEventListener('mousemove', onGlobalMove);
 window.addEventListener('mouseup', onGlobalUp);
+// ── FOCO / TECLADO EN AE ──
+// MAC: cualquier manipulacion de foco (window.focus(), .focus() a un elemento, blur) SACA del
+// panel y AE termina reproduciendo su composicion. Por eso en Mac NO tocamos el foco: el clic
+// nativo ya enfoca el WebView del panel (igual que en Windows), y el enrutado de Space/Enter/
+// Delete/Cmd+Z al panel lo resuelve registerKeyEventsInterest con el keyCode CORRECTO (ver
+// _registerKeys: JS keyCode 32 para Space, no el virtual de macOS 49, que era el bug real).
+// WINDOWS: reclamar el foco de la ventana funciona perfecto — NO se cambia.
+function reclaimFocus(e){
+  if(!IN_AE || IS_MAC) return;   // MAC: no tocar el foco en absoluto
+  try{ window.focus(); }catch(e4){}
+  try{ if(document.activeElement && document.activeElement.blur && /^(BUTTON|A)$/.test(document.activeElement.tagName)) document.activeElement.blur(); }catch(e5){}
+}
+if(IN_AE){
+  if(!IS_MAC){
+    window.addEventListener('mousedown', reclaimFocus, true);
+    window.addEventListener('pointerdown', reclaimFocus, true);
+    window.addEventListener('touchstart', reclaimFocus, true);
+  }
+  // Re-registrar el interes de teclas al (re)enfocar la ventana; algunas versiones de CEP lo
+  // pierden al cambiar de ventana. Inocuo, y ayuda a que las teclas vayan al panel.
+  window.addEventListener('focus', function(){ try{ if(csInterface && csInterface.registerKeyEventsInterest) _registerKeys(); }catch(e){} });
+}
 window.addEventListener('resize', function(){ tlRefresh(); updateLyricHighlight(AEL.currentTime||0); });
 window.addEventListener('mousedown', function(e){ if(!e.target.closest('#rateMenu')&&!e.target.closest('#tRate')) closeRateMenu(); if(!e.target.closest('#importMenu')&&!e.target.closest('#mainActionBtn')) closeImportMenu(); });
 
@@ -948,20 +971,27 @@ function showSpeedDots(rate){
 }
 // ─── Barra de progreso (ancho del timer). Para procesos largos: avanza con el tiempo
 // (creep asintotico) y se completa al terminar. Si hay conteo real, setProgress(frac) manda.
+function _pbarHide(p){ if(!p) return; p.classList.remove('on'); if(p.firstChild) p.firstChild.style.width='0'; }
 function startProgress(estMs){
   var p=document.getElementById('tPbar'); if(!p) return; var bar=p.firstChild;
-  clearTimeout(p._h); if(p._raf){ cancelAnimationFrame(p._raf); p._raf=null; }
+  clearTimeout(p._h); clearTimeout(p._safety); if(p._raf){ cancelAnimationFrame(p._raf); p._raf=null; }
   p.classList.add('on'); bar.style.width='2%';
   var t0=Date.now(), est=estMs||7000;
   (function creep(){ var e=(Date.now()-t0)/est, f=Math.min(0.92, 1-Math.exp(-e*1.6)); bar.style.width=(f*100).toFixed(1)+'%'; p._raf=requestAnimationFrame(creep); })();
+  // Red de seguridad (se veia en Mac que la barra quedaba pegada): si ningun stopProgress la
+  // cierra —dialogo cancelado, error, o un nuevo start que cancelo el ocultado— se oculta igual.
+  // El tope se reinicia en cada start/set, asi que procesos largos legitimos no se cortan antes.
+  p._safety=setTimeout(function(){ if(p._raf){ cancelAnimationFrame(p._raf); p._raf=null; } _pbarHide(p); }, Math.max(15000,(est||0)+8000));
 }
 function setProgress(frac){
   var p=document.getElementById('tPbar'); if(!p) return; if(p._raf){ cancelAnimationFrame(p._raf); p._raf=null; }
+  clearTimeout(p._safety); p._safety=setTimeout(function(){ _pbarHide(p); }, 15000);
   p.classList.add('on'); p.firstChild.style.width=(Math.max(0,Math.min(1,frac))*100).toFixed(1)+'%';
 }
 function stopProgress(){
   var p=document.getElementById('tPbar'); if(!p) return; if(p._raf){ cancelAnimationFrame(p._raf); p._raf=null; }
-  p.firstChild.style.width='100%'; clearTimeout(p._h); p._h=setTimeout(function(){ p.classList.remove('on'); p.firstChild.style.width='0'; }, 450);
+  clearTimeout(p._safety);
+  p.firstChild.style.width='100%'; clearTimeout(p._h); p._h=setTimeout(function(){ _pbarHide(p); }, 450);   // llena y desaparece al completar
 }
 // Cargar una cancion nueva resetea playbackRate a 1 -> reaplicar la velocidad global.
 function applyGlobalRate(){
@@ -991,7 +1021,7 @@ try{ buildActionBar(); }catch(e){}
 if(IS_TOUCH){ try{ buildTouchTimelineControls(); }catch(e){} try{ buildHamburger(); }catch(e){} }
 // On open: pull the active channel's audio AND auto-fill every channel's Artist/Song from
 // its song filename (silently) — no manual refresh needed.
-if(IN_AE){ _registerKeys(); ensureHost(function(ok){ if(ok){ aeLoadSong(getActive()); refreshAllTitles(null, true); } }); }
+if(IN_AE){ _registerKeys(); setTimeout(_registerKeys, 800); setTimeout(_registerKeys, 2500); ensureHost(function(ok){ if(ok){ aeLoadSong(getActive()); refreshAllTitles(null, true); } }); }   // re-registro con retraso: en Mac el registro inicial puede ocurrir antes de que el panel este listo
 // Auto-sync: while the panel stays open, detect when the project changes (opened/switched)
 // and re-pull every channel's titles automatically. One cheap probe per tick; a full
 // refresh only fires when the project signature actually changes.
@@ -1140,7 +1170,10 @@ function _extBase(){
 }
 function probeHost(cb){ if(!csInterface){ cb(false); return; } csInterface.evalScript('(typeof importLyricsToComp==="function" && typeof _hostVersion==="function")?"1":"0"', function(r){ cb(r==='1'); }); }
 function loadHostViaXHR(done){
-  if(_hostSrc){ csInterface.evalScript(_hostSrc, function(){ done(); }); return; }
+  // SIEMPRE via red (nunca reusar _hostSrc en cache): el motor de ExtendScript persiste
+  // entre acciones del panel y no relee el .jsx solo porque cambio en disco — reusar el
+  // texto ya cargado dejaba acciones corriendo con logica vieja aunque el archivo ya
+  // estuviera corregido. El costo (una peticion GET chica) es insignificante.
   try{
     var xhr=new XMLHttpRequest(); xhr.open('GET','jsx/host.jsx?ts='+Date.now(),true);
     xhr.onreadystatechange=function(){ if(xhr.readyState!==4) return;
@@ -1157,12 +1190,13 @@ function loadHostViaPath(done){
   var hp=(ext.replace(/[\/\\]+$/,'')+'/jsx/host.jsx').replace(/\\/g,'/');
   csInterface.evalScript('(function(){try{$.evalFile(new File("'+hp+'"));return "1";}catch(e){return "0";}})()', function(){ done(); });
 }
-// Run cb(true) once the CURRENT host.jsx is loaded. The ExtendScript engine persists
-// across panel reloads and may hold a stale version, so on the first call this session
-// we ALWAYS re-evaluate the fresh source (XHR) before trusting it — never skip on probe.
+// Run cb(true) once the CURRENT host.jsx is loaded. El motor de ExtendScript persiste
+// entre acciones del panel y NO relee el archivo solo porque cambio en disco — por eso
+// SIEMPRE re-evaluamos la fuente actual (XHR) en cada llamada, nunca nos quedamos con la
+// version ya cargada. Sin esto, una correccion en host.jsx no se reflejaba hasta cerrar y
+// reabrir el panel entero, dando la falsa impresion de que el fix "no funcionaba".
 function ensureHost(cb){
   if(!csInterface){ cb(false); return; }
-  if(_hostReady){ cb(true); return; }
   loadHostViaXHR(function(){
     probeHost(function(ok){
       if(ok){ _hostReady=true; cb(true); return; }
@@ -1516,37 +1550,28 @@ function updateLyricHighlight(t){
     var st=stamps[k].time, ln=(stamps[k].len!=null)?stamps[k].len:((k+1<stamps.length)?(stamps[k+1].time-st):(dur?dur-st:3)), en=st+Math.max(0.05,ln);
     if(t>=st && t<en){ activeLi=stamps[k].lineIdx; break; }
   }
-  var nextLi=nextStampable(curLine);   // linea a marcar (pista tenue, NO "activa")
   // ACTIVA = solo la linea cuyo marcador cubre el tiempo actual. En huecos entre marcadores
-  // NO hay activa (esa parte queda inactiva/vacia, como antes). nextLi es una pista tenue
-  // y NUNCA mueve la letra ni se pinta como activa (por eso no "salta" al ajustar marcadores).
+  // NO hay activa (esa parte queda inactiva/vacia, como antes).
   var byLine={}; for(var q=0;q<stamps.length;q++){ if(byLine[stamps[q].lineIdx]===undefined) byLine[stamps[q].lineIdx]=q; }
   var flow=document.getElementById('lyrFlow'), nodes=flow.children, centerNode=null;
   for(var n=0;n<nodes.length;n++){
     var el=nodes[n]; if(el.classList.contains('section')) continue;
     var li=+el.dataset.i, si=(byLine[li]===undefined?-1:byLine[li]);
-    var state;
-    if(li===activeLi){ state='active'; centerNode=el; }               // solo la activa centra
-    else if(si>=0){ var s2=stamps[si].time, l2=(stamps[si].len!=null)?stamps[si].len:((si+1<stamps.length)?(stamps[si+1].time-s2):(dur?dur-s2:3)), e2=s2+Math.max(0.05,l2); state=(t>=e2)?'past':'future'; }
-    else if(li===nextLi){ state='next'; }                            // pista tenue, sin centrar
-    else state='future';
+    var state=(li===activeLi)?'active':'inactive';   // solo 2 estados visuales
+    if(state==='active') centerNode=el;
     // Solo escribe el DOM si el estado cambio (clave = estado). Gran ahorro por frame en Mac.
     if(el._sk!==state){
       el._sk=state;
       var lk=el.firstChild;
-      if(lk) lk.style.color = state==='active'?'rgba(255,255,255,.98)':state==='next'?'rgba(255,255,255,.5)':state==='past'?'rgba(255,255,255,.5)':'rgba(255,255,255,.26)';
+      // Activa = blanco pleno + semibold (destaca cual se esta cantando); todo lo demas
+      // (previous/next/sin marcar) = 25% opacidad + peso regular, uniforme.
+      if(lk) lk.style.color = (state==='active') ? '#fff' : 'rgba(255,255,255,.25)';
       el.style.fontWeight = (state==='active') ? '600' : '400';
     }
   }
   if(lyrManualY!==null && (AEL.paused || Date.now()<lyrBrowseUntil)) return; // user is browsing the lyrics
   flow.classList.remove('nodrift');
   if(centerNode){ var stage=document.getElementById('lyrStage'); flow.style.transform='translateY('+(-(centerNode.offsetTop - stage.clientHeight/2 + centerNode.offsetHeight/2))+'px)'; }
-}
-// Line colouring: active line = accent blue, already-sung = muted blue, not-yet-done = dark
-function paintLine(el, state){
-  var lk=el.firstChild; if(!lk) return;
-  // Activa = BLANCO (destaca); ya cantada = blanco tenue; pendiente = muy tenue.
-  lk.style.color = state==='active' ? 'rgba(255,255,255,.98)' : state==='past' ? 'rgba(255,255,255,.5)' : 'rgba(255,255,255,.26)';
 }
 function seekToLine(i){
   if(!dur){ toast('Load audio first'); return; }
@@ -1730,6 +1755,7 @@ function togglePlay(){
     return;
   }
   if(AEL.paused){ var _pp=AEL.play(); if(_pp&&_pp['catch']) _pp['catch'](function(err){ toast('No se pudo reproducir: '+((err&&err.name)||err)); }); } else AEL.pause();
+  if(IN_AE) setTimeout(reclaimFocus, 30);   // mantener el foco en el panel tras dar play (que Space siga en Verso)
 }
 function toggleRateMenu(ev){
   if(ev) ev.stopPropagation();
@@ -1830,12 +1856,18 @@ function exportOne(ch){
   toast('✓ SRT exportado: '+_srtName(ch));
 }
 // Todos de una sola vez, nombrados "NN Artist - Song". El numero manda el orden en AE.
+// Los dlText() van ESPACIADOS (no todos en el mismo tick): con 11 canales, disparar 11
+// descargas sincronas de golpe choca con el limite de "descargas automaticas seguidas"
+// de Chrome (bloquea las que sobran del cupo, casi siempre la ultima) — Verso/CM nunca
+// lo tocaban por tener pocos canales. Espaciarlas evita el bloqueo sin afectar el orden.
 function exportAll(){
   saveWorkingSet();
   var lpb=1, lpbEl=document.getElementById('lpb'); if(lpbEl) lpb=parseInt(lpbEl.value)||1;
-  var n=0;
-  channels.forEach(function(c){ var srt=buildSRTFor(c, lpb); if(!srt.trim()) return; dlText(srt, _srtName(c)); n++; });
-  toast(n?('✓ Exportados '+n+' SRT (por numeracion)'):'No hay canales terminados para exportar');
+  var jobs=[];
+  channels.forEach(function(c){ var srt=buildSRTFor(c, lpb); if(srt.trim()) jobs.push({c:c,srt:srt}); });
+  if(!jobs.length){ toast('No hay canales terminados para exportar'); return; }
+  jobs.forEach(function(j,i){ setTimeout(function(){ dlText(j.srt, _srtName(j.c)); }, i*350); });
+  toast('✓ Exportando '+jobs.length+' SRT (por numeracion)');
 }
 // AE: update ALL thumbnails at once (Artist/Song of every "… TH" comp).
 function thumbnailAll(){
@@ -1888,7 +1920,7 @@ function _evalDlg(script, cb){
   _initHostEvents();
   try{ startProgress(9000); }catch(e){}   // barra de progreso para todo proceso largo
   var done=false, tries=0, timer=null;
-  function finish(v){ if(done) return; done=true; _dlgPending=null; if(timer) clearInterval(timer); try{ stopProgress(); }catch(e){} cb(v); }
+  function finish(v){ if(done) return; done=true; _dlgPending=null; if(timer) clearInterval(timer); try{ stopProgress(); }catch(e){} try{ reclaimFocus(); }catch(e){} cb(v); }   // tras importar (dialogo de AE) devolvemos el foco al panel
   _dlgPending=finish;                       // 1) via evento (la fiable)
   csInterface.evalScript(script, function(raw){ if(raw) finish(raw); });   // 2) retorno directo
   // 3) respaldo: sondeo por temporizador del volcado temporal. Independiente de los
@@ -2026,25 +2058,64 @@ function onKey(e){
   if(e.code==='Enter'||e.code==='NumpadEnter'){ stop(); doStamp(); return; }
   if((e.code==='Delete'||e.code==='Backspace') && selStampSet.size){ stop(); pushUndo(); stamps=stamps.filter(function(s){ return !selStampSet.has(s.id); }); selStampSet.clear(); recomputeCurLine(); saveWorkingSet(); updTimed(); tlRefresh(); updateLyricHighlight(AEL.currentTime||0); toast('Marcador(es) borrado(s)'); }
 }
-// CEP: reclamar estas combinaciones para que AE NO las procese (y no cambie el foco al
-// proyecto). Los keyCode difieren entre Mac y Windows, por eso se calculan segun la plataforma.
+// CEP: reclamar estas combinaciones para que AE NO las procese (que no reproduzca su comp con
+// Space, no dispare el undo del proyecto con Cmd+Z, etc.) y las reciba el panel.
+// CLAVE: registerKeyEventsInterest usa el keyCode de JavaScript (Space=32, Enter=13, Z=90...),
+// el MISMO en Windows y Mac. El bug era usar en Mac los virtuales de macOS (Space=49): AE nunca
+// soltaba Space y reproducia su composicion. Ahora Mac usa 32 igual que Windows.
 function _registerKeys(){
   try{
-    if(!csInterface || !csInterface.registerKeyEventsInterest) return;
-    var mac=(navigator.platform||'').toLowerCase().indexOf('mac')>=0;
-    var Z=mac?6:90, Y=mac?16:89, SP=mac?49:32, ENT=mac?36:13, NENT=mac?76:13, DEL=mac?51:8, FDEL=mac?117:46;
-    // Cada evento con TODOS los modificadores explicitos (algunas versiones de CEP los exigen).
-    function K(code, ctrl, meta, shift){ return { keyCode:code, ctrlKey:!!ctrl, altKey:false, shiftKey:!!shift, metaKey:!!meta }; }
-    var ev=[
-      K(Z,true,false,false), K(Z,false,true,false),          // Ctrl+Z / Cmd+Z  (undo)
-      K(Z,true,false,true),  K(Z,false,true,true),           // +Shift          (redo)
-      K(Y,true,false,false), K(Y,false,true,false),          // Ctrl/Cmd+Y      (redo)
-      K(SP,false,false,false),                               // Space           (play)
-      K(ENT,false,false,false), K(NENT,false,false,false),   // Enter / Intro   (stamp)
-      K(DEL,false,false,false), K(FDEL,false,false,false)    // Backspace / Del (borrar marcador)
-    ];
-    csInterface.registerKeyEventsInterest(JSON.stringify(ev));
-  }catch(e){}
+    if(!csInterface || !csInterface.registerKeyEventsInterest){
+      if(IS_MAC && !_registerKeys._warned){ _registerKeys._warned=1; toast('⚠ registerKeyEventsInterest no disponible en este CEP — avisa a soporte', 6000); }
+      return;
+    }
+    var ev;
+    if(IS_MAC){
+      // MAC: formato minimo (solo el modificador que aplica) como en el ejemplo oficial de CEP.
+      // keyCode JS primero; ademas se anaden los virtuales de macOS como respaldo por si esta
+      // version de CEP los usara (registrar de mas es inocuo).
+      ev=[];
+      function m(code, mods){ var o={keyCode:code}; if(mods) for(var k in mods) o[k]=mods[k]; ev.push(o); }
+      // NO TOCAR: formato ya confirmado funcionando para Play en Mac.
+      m(32);                                            // Space (play)
+      m(13);                                            // Enter / NumpadEnter (stamp) — ambos son keyCode 13
+      m(8); m(46);                                      // Backspace / Delete (borrar)
+      // Undo/Redo: mismas combinaciones pero con las 4 banderas SIEMPRE explicitas (formato
+      // K() ya probado en Windows), por si el matcher nativo de esta build de CEP requiere el
+      // descriptor completo para combos CON modificador (Space no lleva ninguno, por eso el
+      // formato minimo le bastaba pero nunca se puso a prueba con Cmd/Ctrl).
+      function K2(code, ctrl, meta, shift){ return { keyCode:code, ctrlKey:!!ctrl, altKey:false, shiftKey:!!shift, metaKey:!!meta }; }
+      ev.push(K2(90,false,true,false), K2(90,false,true,true));   // Cmd+Z / Cmd+Shift+Z (undo/redo)
+      ev.push(K2(90,true,false,false), K2(90,true,false,true));   // Ctrl+Z / Ctrl+Shift+Z
+      ev.push(K2(89,false,true,false), K2(89,true,false,false));  // Cmd/Ctrl+Y (redo)
+      // Respaldo: mismos combos con los virtual keycodes de macOS (Z=6, Y=16) por si esta
+      // build los matchea por codigo nativo en vez del JS keyCode.
+      m(90,{metaKey:true}); m(90,{metaKey:true,shiftKey:true});
+      m(90,{ctrlKey:true}); m(90,{ctrlKey:true,shiftKey:true});
+      m(89,{metaKey:true}); m(89,{ctrlKey:true});
+      m(6,{metaKey:true}); m(6,{metaKey:true,shiftKey:true}); m(6,{ctrlKey:true}); m(6,{ctrlKey:true,shiftKey:true});
+      m(16,{metaKey:true}); m(16,{ctrlKey:true});
+      // Respaldo generico: virtual keycodes de macOS para Enter/Delete
+      m(49); m(36); m(76); m(51); m(117);
+    } else {
+      // WINDOWS: formato que ya funciona perfecto — NO cambiar.
+      function K(code, ctrl, meta, shift){ return { keyCode:code, ctrlKey:!!ctrl, altKey:false, shiftKey:!!shift, metaKey:!!meta }; }
+      ev=[
+        K(90,true,false,false), K(90,false,true,false),   // Ctrl+Z / Cmd+Z  (undo)
+        K(90,true,false,true),  K(90,false,true,true),    // +Shift          (redo)
+        K(89,true,false,false), K(89,false,true,false),   // Ctrl/Cmd+Y      (redo)
+        K(32,false,false,false),                          // Space           (play)
+        K(13,false,false,false),                          // Enter           (stamp)
+        K(8,false,false,false), K(46,false,false,false)   // Backspace / Del (borrar)
+      ];
+    }
+    var _r=csInterface.registerKeyEventsInterest(JSON.stringify(ev));
+    // Diagnostico (una vez): confirma en vivo si el registro se ejecuto sin lanzar. No
+    // garantiza que AE lo honre, pero descarta que el bridge nativo este ausente o fallando.
+    if(IS_MAC && !_registerKeys._ok){ _registerKeys._ok=1; toast('Verso: teclas registradas ('+ev.length+')', 2500); }
+  }catch(e){
+    if(IS_MAC && !_registerKeys._err){ _registerKeys._err=1; toast('⚠ Verso: fallo registrando teclas — '+(e&&e.message||e), 6000); }
+  }
 }
 
 // ─── GLOBAL MOUSE ───

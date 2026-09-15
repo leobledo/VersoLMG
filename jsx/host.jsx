@@ -1357,12 +1357,10 @@ function masterRun(isShort) {
       }
     }
 
-    // Rangos: canales de VIDEO + gemelas Short (si both).
+    // Rangos: SOLO canales de VIDEO. Las gemelas Short NUNCA se ajustan de rango — ya
+    // tienen su duracion preestablecida (workArea/Outro fijos); adjustRangeComp las corria
+    // en base al audio nuevo y terminaba recortando/desplazando capas de esas comps.
     var rangeComps = limitToSelected ? selectedComps.concat([]) : getGeneralComps(false);
-    if (isShort) {
-      if (limitToSelected) { for (var tw2 = 0; tw2 < twins.length; tw2++) rangeComps.push(twins[tw2]); }
-      else { var sg = getGeneralComps(true); for (var tw3 = 0; tw3 < sg.length; tw3++) rangeComps.push(sg[tw3]); }
-    }
     var rangeUpdated = 0, rangeSkipped = 0;
     for (var rc = 0; rc < rangeComps.length; rc++) { if (adjustRangeComp(rangeComps[rc])) rangeUpdated++; else rangeSkipped++; }
 
@@ -1416,22 +1414,24 @@ function doRenderOrQueue(sendToAME, isShort) {
         if (isTHComp(cs)) thComps.push(cs); else mainComps.push(cs);
       }
     } else if (!isShort) {
-      // VIDEO (igual que siempre): main naranja(11) + TH de video.
+      // VIDEO: main = comp NARANJA (label 11) de video + TH de video. La etiqueta de color
+      // es el discriminador (como ya funcionaba): las escenas o comps numeradas que NO son
+      // canal (p.ej. "01 Distrito") tienen otra etiqueta y quedan fuera.
       for (var i2 = 1; i2 <= app.project.numItems; i2++) {
         var item = app.project.item(i2);
         if (!(item instanceof CompItem)) continue;
-        if (isTHComp(item)) { if (_modeMatch(item.name, false)) thComps.push(item); }
-        else if (item.label === 11 && _modeMatch(item.name, false)) mainComps.push(item);
+        if (isTHComp(item)) { if (!_isShortName(item.name)) thComps.push(item); }
+        else if (item.label === 11 && !_isShortName(item.name) && item.name.toLowerCase().indexOf('lyrics') === -1) mainComps.push(item);
       }
     } else {
-      // SHORTS (ambos): mains de VIDEO + mains SHORT de cada canal + TH de VIDEO.
-      // Los "… Short TH" NO se renderizan (peticion explicita).
-      mainComps = getGeneralComps(false);
-      var sm = getGeneralComps(true);
-      for (var q3 = 0; q3 < sm.length; q3++) mainComps.push(sm[q3]);
+      // SHORTS: main de VIDEO (naranja 11) + main SHORT (amarillo 2) + TH de VIDEO. Los
+      // "… Short TH" NO van; y solo cuentan las comps con etiqueta de canal (no escenas).
       for (var i3 = 1; i3 <= app.project.numItems; i3++) {
         var it3 = app.project.item(i3);
-        if (it3 instanceof CompItem && isTHComp(it3) && !_isShortName(it3.name)) thComps.push(it3);
+        if (!(it3 instanceof CompItem)) continue;
+        if (it3.name.toLowerCase().indexOf('lyrics') !== -1) continue;
+        if (isTHComp(it3)) { if (!_isShortName(it3.name)) thComps.push(it3); }
+        else if ((it3.label === 11 && !_isShortName(it3.name)) || (it3.label === 2 && _isShortName(it3.name))) mainComps.push(it3);
       }
     }
     if (thComps.length === 0 && mainComps.length === 0)
@@ -2070,7 +2070,17 @@ function importLyricsToComp(lyrCompName, srtContent, optionsJSON) {
     var styleName = opt.styleLayerName || 'Style Controler';
 
     var comp = _findCompByNameCI(lyrCompName);
-    if (!comp) comp = _lyricsCompByNum(_leadNum(lyrCompName));
+    if (!comp) {
+      // Fallback CONSCIENTE del modo: para "… Short Lyrics" busca la Lyrics Short del canal,
+      // no la de video (_lyricsCompByNum devolvia la primera = la de video). Mismo fix que ya
+      // tenia bulkImportOne — faltaba aqui, por eso el import INDIVIDUAL podia fallar/pegar en
+      // la comp equivocada cuando el nombre exacto no coincidia, mientras que el bulk si funcionaba.
+      var wantShort = _isShortName(lyrCompName), nn = _leadNum(lyrCompName), qi;
+      for (qi = 1; qi <= app.project.numItems && !comp; qi++) {
+        var qt = app.project.item(qi);
+        if (_isLyricsComp(qt) && _leadNum(qt.name) === nn && (_isShortName(qt.name) === wantShort)) comp = qt;
+      }
+    }
     if (!comp) {
       app.endUndoGroup();
       return 'err:Comp "' + lyrCompName + '" not found in the project.';
