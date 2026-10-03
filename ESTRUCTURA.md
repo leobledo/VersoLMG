@@ -1,7 +1,7 @@
 # Verso LMG — Mapa de estructura
 
-> Referencia rápida para no tener que releer `index.html` (2750 líneas) ni
-> `jsx/host.jsx` (2486 líneas) completos en cada sesión. Actualizar esta tabla
+> Referencia rápida para no tener que releer `index.html` (3030 líneas) ni
+> `jsx/host.jsx` (2532 líneas) completos en cada sesión. Actualizar esta tabla
 > cuando cambien secciones grandes o se resuelvan bugs de plataforma nuevos.
 >
 > Panel CEP de After Effects para timestamping de letras/SRT, 11 canales.
@@ -11,8 +11,8 @@
 
 | Archivo | Líneas | Rol |
 |---|---|---|
-| `index.html` | ~2750 | UI + toda la lógica del panel (CSS + JS inline, un solo `<script>`) |
-| `jsx/host.jsx` | ~2486 | ExtendScript (ES3) que corre dentro de AE: manipula comps/capas |
+| `index.html` | ~3030 | UI + toda la lógica del panel (CSS + JS inline, un solo `<script>`) |
+| `jsx/host.jsx` | ~2532 | ExtendScript (ES3) que corre dentro de AE: manipula comps/capas |
 | `CSInterface.js` | ~103 | Bridge CEP recortado a mano (NO es el oficial de Adobe — ver más abajo) |
 | `CSXS/manifest.xml` | — | Manifest de la extensión (nombre "Verso LMG") |
 
@@ -96,9 +96,10 @@ Secciones marcadas con `// ─── NOMBRE ───` en el código — buscar 
 | 2315 | MASTER / RENDER | `masterRun`, `doRenderOrQueue` (llaman a host.jsx) |
 | 2370 | THUMBNAIL | actualiza comps "… TH" |
 | 2403 | IMPORT MENU | |
-| 2459 | AUTO-SYNC | LRCLIB (fallback, preserva secciones de Genius) |
-| 2519 | GENIUS BULK | |
-| 2727 | UTILS | `fmtClock`, `esc`, etc. |
+| 2460 | AUTO-SYNC | LRCLIB (fallback, preserva secciones de Genius) |
+| 2520 | GENIUS BULK | links por canal; `loadGenius()` (máx. 3 a la vez, link i → canal i) — ver sección Genius |
+| **2632** | **GENIUS FETCH ENGINE** | `fetchGeniusLyrics`, embed/página/curl/LRCLIB, verificación por URL canónica — ver sección Genius |
+| 3007 | UTILS | `fmtClock`, `esc`, etc. |
 
 ---
 
@@ -106,16 +107,22 @@ Secciones marcadas con `// ─── NOMBRE ───` en el código — buscar 
 
 Sin `const/let/arrow/template literals` — ES3 puro. Funciones clave por tema:
 
-**Diálogos/CEP bridge** (líneas 12–33, 2227–2280):
+**Diálogos/CEP bridge** (líneas 12–33, 2264–2325):
 `_isWin`, `_dlgFilter`, `_AUDIO_FILTER`/`_SRT_FILTER` (strings literales — NO
 recursivas, ver Bugs resueltos), `_notify`/`_writeResult`/`_writeRaw`/
 `_clearResult`/`_readResultText` (triple redundancia para el bug de
 evalScript-pierde-return-con-dialogo-modal)
 
-**Import SRT** (19–301, 2065–2203):
+**Import SRT** (19–301, 2065–2119, 2191–2246):
 `saveSRTFile`, `_parseSRT`, `importSRTToComp`, `importViaStyleController`,
 `importLyricsToComp`, `importLyricsToMany`, `bulkImportOne`,
 `importSRTBatch(isShort)` — matchea por número líder de archivo (`_leadNum`)
+
+**Genius vía curl** (2120–2185):
+`fetchGeniusToFile(url, tag)` — curl del sistema a un archivo temporal
+**único por petición** (`verso_genius_<tag>.html`); en Mac usa `/usr/bin/curl
+--compressed` y devuelve además la URL final. `fetchGeniusToTemp(url)` queda
+como alias de compatibilidad. `_cleanGeniusTemp()` borra descargas > 10 min.
 
 **Capas de estilo/keyframes** (485–1991):
 `applyStyleToSRTLayers`, `_buildStyleFrame`, `_buildLyricLayers`,
@@ -142,7 +149,7 @@ entraran al render por error.
 `_leadNum`, `_lyricsCompByNum`, `_thCompByNum`, `_songByNum`,
 `getProjectChannels` — todo el mapeo canal-número vive aquí
 
-**Thumbnails** (2392–2486):
+**Thumbnails** (2437–2532):
 `updateThumbnailComp`, `updateThumbnailBoth` (video+short), mode-aware
 fallback para no confundir TH de video con Short TH
 
@@ -218,6 +225,56 @@ foco está en INPUT/TEXTAREA/SELECT.
 
 ---
 
+## Genius — carga de letras (web + AE) — octubre 2026
+
+Mismo motor en **Verso, Verso CM y Verso LMG** (sección `// ─── GENIUS FETCH
+ENGINE ───` de `index.html` + `fetchGeniusToFile` en `host.jsx`).
+
+### Regla de oro
+**Una petición = un link.** Nada se comparte entre peticiones y cada resultado
+se verifica contra la URL canónica de su link (`_gVerify`): cada canal recibe
+SIEMPRE la letra de SU link, en el orden de los links (`loadGenius` aplica por
+índice y, si el link se movió de fila mientras cargaba, lo sigue).
+
+### Rutas (gana la primera letra verificada)
+1. **embed** — `genius.com/songs/<id>/embed.js`: CORS abierto (`*`), ~6 KB, trae
+   las [Secciones] y el texto SIN las marcas de agua de la página. El `<id>` sale
+   de la API de búsqueda (`/api/search/song`, match EXACTO de la URL del link,
+   página 1 y 2) o de la caché `localStorage['verso_genius_ids']`.
+2. **API oficial con token (opcional)** — `GENIUS_API_TOKEN` (o
+   `localStorage['verso_genius_token']`): `api.genius.com/search` tiene CORS, así
+   que con token la web resuelve el id sin proxies. Sin token se salta.
+3. **página** — HTML de Genius: directo en AE; vía proxies CORS en web.
+4. **curl** (solo AE) — `_aeCurlFetch`: COLA, una descarga a la vez, cada una a
+   su archivo temporal; el panel lo lee con `cep.fs` y lo borra.
+5. **LRCLIB** — último recurso (sin [Secciones]); solo acepta un resultado cuyo
+   artista+título cubra ≥75% de las palabras del slug. La búsqueda va SIN
+   conectores ("and", "feat"…): con ellos LRCLIB devuelve 0 resultados.
+
+Niveles AE: [embed cacheado + token + página directa + búsqueda directa] →
+[curl] → [proxies]. Web: [embed cacheado + token] → [proxies]. Si todo falla se
+reintenta una vez y luego LRCLIB. `loadGenius`: máx. 3 canciones a la vez + una
+pasada final, una por una, para los links que fallen; si algo falla, la sección
+de links queda abierta con el detalle por canal y "Load" reintenta.
+
+### Proxies web (estado medido oct-2026, origen no-localhost)
+corsfix → 403/400 (requiere dominio registrado; solo sirve en localhost) ·
+corsproxy.io → 401 (API key) · thingproxy → no existe (quitados ambos) ·
+allorigins/codetabs → intermitentes (timeouts/522/500), allorigins responde
+mejor a la búsqueda JSON (13 KB) que a la página (400–700 KB). Por eso la
+salud de cada proxy se rastrea (`_gHealth`) y la web solo es 100% confiable
+con el token oficial.
+
+### Limpieza de texto
+`_geniusNodeText` quita del contenedor de la letra los nodos
+`data-exclude-from-selection` (encabezado contribuidores/traducciones/"Read
+More" y anuncios). `_gTidy` convierte las marcas de agua de la página (letras
+cirílicas/griegas idénticas a latinas, p. ej. "е" U+0435, y espacios U+2005 /
+U+205F) a sus equivalentes normales **solo en palabras con letras latinas**.
+Verificado con 12 canciones: página y embed dan texto idéntico byte a byte.
+
+---
+
 ## Diseño (colores/gradientes) — notas de decisiones tomadas
 
 - Paleta: gris opaco `#8a8a8a` como acento (reemplazó indigo original).
@@ -255,6 +312,23 @@ foco está en INPUT/TEXTAREA/SELECT.
    (`_safety` timeout) por si algún camino no llamaba `stopProgress`.
 8. **Play/teclado en Mac** — ver sección dedicada arriba. Causa raíz:
    `registerKeyEventsInterest` faltante en `CSInterface.js`.
+9. **Genius en AE/Mac: la MISMA letra en todos los canales** — todas las
+   descargas con curl escribían el mismo `verso_genius.html`; en Mac los
+   callbacks de `evalScript` llegan cuando la cola de ExtendScript ya terminó,
+   así que todos los canales leían el último archivo (la letra del último
+   link) y el panel incluso decía "✓ 11/11". En Windows el callback llega tras
+   cada script, por eso allá funcionaba. Fix: archivo temporal único por
+   petición (`fetchGeniusToFile(url, tag)`), cola secuencial en el panel y
+   verificación por URL canónica. Reproducido y verificado con un simulador
+   del puente CEP (callbacks diferidos estilo Mac + curl real): original 1/11
+   correctos, nuevo 11/11.
+10. **Genius en web: canales vacíos al azar** — 11 canales × 7 fuentes = 77
+    peticiones de golpe a proxies gratuitos que hoy fallan o rechazan
+    (ver "Proxies web"). Fix: ruta embed con CORS, máx. 3 canciones a la vez,
+    reintento, LRCLIB corregido y token oficial opcional.
+11. **`ensureHost` por cada canción** — el fallback de curl recargaba el
+    `host.jsx` completo (~110 KB) por cada canal. Ahora un `typeof` barato y
+    solo si falta se recarga.
 
 ---
 
@@ -266,3 +340,7 @@ foco está en INPUT/TEXTAREA/SELECT.
   A la fecha de este documento: Mac/teclado, foco, barra de progreso y
   gradiente de letra están **confirmados funcionando en LMG**, aún no
   replicados a Verso/CM.
+- El arreglo de Genius (oct-2026) **sí** está aplicado en las 3 versiones
+  (carpeta `Verso Updates`). Falta confirmarlo dentro de AE en Mac y Windows.
+- Web 100% confiable requiere el token oficial de Genius (`GENIUS_API_TOKEN`);
+  la ruta con token está implementada pero no se pudo probar con un token real.

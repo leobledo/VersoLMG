@@ -2552,144 +2552,423 @@ function geniusDistribute(){
 }
 // Fetch every pasted link → fill each channel's lyrics. Progress shows on the Lyrics
 // button (which reads "Load" while links are present). No separate Load button.
+// Link i → canal i SIEMPRE: cada letra se aplica al canal de SU link (si mueves un link de
+// fila mientras carga, la letra lo sigue). Maximo 3 canciones a la vez:
+// lanzar todos los links de golpe saturaba a Genius y a los proxies y algunos canales
+// volvian vacios al azar. Los links que fallen se reintentan al final, uno por uno.
+var _gRun=0, _gRunKey='';
 function loadGenius(){
-  var lbl=document.getElementById('dpLyrLbl');
-  var pending=0, done=0, okc=0;
-  channels.forEach(function(ch,i){
-    var url=(geniusLinks[i]||'').trim(); if(!url) return;
-    pending++;
-    fetchGeniusLyrics(url, function(err,lyr){
-      done++;
-      if(!err && lyr){ ch.lyricsText=lyr; ch.lines=deriveLines(lyr); ch.loaded=ch.lines.length>0;
-        if(ch.id===activeId){ lines=ch.lines.slice(); renderLyricsFlow(); } okc++; }
-      gStatus(done+'/'+pending+' fetched'+(err?(' · '+ch.name+': '+err):''), err?'#c66':'var(--bl)');
-      if(lbl) lbl.textContent='Loading '+done+'/'+pending;
-      setProgress(done/pending);
-      if(done>=pending){ stopProgress(); closeGenius(); renderChannels(); syncTitle(); toast('✓ Genius lyrics: '+okc+'/'+pending); }
-    });
+  var jobs=[];
+  channels.forEach(function(ch,i){ var url=_gLinkOf(geniusLinks[i]); if(url) jobs.push({ i:i, ch:ch, url:url, err:'' }); });
+  if(!jobs.length){ gStatus('No links to load','#c66'); return; }
+  var runKey=jobs.map(function(j){ return j.i+'|'+j.url; }).join('\n');
+  if(runKey===_gRunKey){ toast('Already loading these links…'); return; }   // doble clic en Load
+  var run=++_gRun; _gRunKey=runKey;
+  var total=jobs.length, settled=0, okc=0, viaLrc=0;
+  function live(){ return run===_gRun; }
+  function paint(){ var lbl=document.getElementById('dpLyrLbl'); if(lbl) lbl.textContent='Loading '+settled+'/'+total; setProgress(Math.max(0.03, settled/total)); }
+  function apply(j, lyr){
+    var idx=(_gLinkOf(geniusLinks[j.i])===j.url)?j.i:-1, k;
+    if(idx<0){ for(k=0;k<geniusLinks.length;k++){ if(_gLinkOf(geniusLinks[k])===j.url){ idx=k; break; } } }
+    var ch=idx>=0?channels[idx]:null; if(!ch) return false;
+    ch.lyricsText=lyr; ch.lines=deriveLines(lyr); ch.loaded=ch.lines.length>0; ch.geniusUrl=j.url;
+    if(ch.id===activeId){ lines=ch.lines.slice(); curLine=nextStampable(0); pendingId=null; renderLyricsFlow(); }
+    var ta=document.querySelector('.channel[data-id="'+ch.id+'"] .ch-lyr'); if(ta){ ta.value=ch.lyricsText; ta.classList.add('filled'); }
+    return true;
+  }
+  function pass(list, conc, done){
+    var next=0, active=0, failed=[];
+    (function pump(){
+      if(!live()) return;
+      while(active<conc && next<list.length){
+        (function(j){
+          active++;
+          fetchGeniusLyrics(j.url, function(err, lyr, src){
+            active--;
+            if(!live()) return;
+            if(!err && lyr && apply(j, lyr)){ settled++; okc++; if(src==='lrclib') viaLrc++; gStatus(settled+'/'+total+' · ✓ '+j.ch.name+(src==='lrclib'?' (LRCLIB)':''), 'var(--bl)'); }
+            else { j.err=err||'no lyrics found'; failed.push(j); }
+            paint(); pump();
+          });
+        })(list[next++]);
+      }
+      if(!active && next>=list.length) done(failed);
+    })();
+  }
+  function finish(failed){
+    if(!live()) return;
+    _gRunKey='';
+    stopProgress(); renderChannels(); syncTitle();
+    var msg='✓ Genius lyrics: '+okc+'/'+total+(viaLrc?(' · '+viaLrc+' via LRCLIB (no [sections])'):'');
+    if(failed.length){
+      // Deja la seccion de links abierta con el detalle: "Load" reintenta (lo ya cargado sale de cache).
+      var gb=document.getElementById('dpGlobalBar'); if(gb && !gb.classList.contains('genius-open')) toggleGeniusBulk();
+      gStatus('✗ '+failed.map(function(j){ return j.ch.name+': '+j.err; }).join(' · ')+' — press Load to retry', '#c66');
+      toast(msg+' · ✗ '+failed.length+' failed', 8000);
+    } else { closeGenius(); toast(msg); }
+  }
+  paint(); gStatus('Loading '+total+' link'+(total>1?'s':'')+'…', 'var(--bl)');
+  pass(jobs, 3, function(failed){
+    if(!failed.length){ finish(failed); return; }
+    gStatus('Retrying '+failed.length+'…', 'var(--bl)');
+    setTimeout(function(){
+      if(!live()) return;
+      failed.forEach(function(j){ j.err=''; });
+      pass(failed, 1, function(f2){ settled+=f2.length; paint(); finish(f2); });
+    }, 1500);
   });
-  if(!pending){ gStatus('No links to load','#c66'); return; }
-  if(lbl) lbl.textContent='Loading…'; setProgress(0.02);
 }
 // Discreet progress message for the import (small line — popup status / toast).
 function _geniusProgMsg(p){
   if(!p) return 'Fetching lyrics…';
   if(p.stage==='done')   return '✓ Lyrics loaded';
   if(p.stage==='deep')   return 'Fetching lyrics… (deep search)';
+  if(p.stage==='retry')  return 'Fetching lyrics… (retrying)';
   if(p.stage==='lrclib') return 'Fetching lyrics… (matching)';
   var n=Math.min((p.done|0)+1, p.total||1);
   return 'Fetching lyrics… ('+n+'/'+(p.total||1)+')';
 }
-// AE can fetch genius.com directly (no web security). On web/touch the browser blocks
-// cross-origin reads, so we go through CORS proxies that return the page.
-// FAST: all proxies race in parallel (8s cap each) AND LRCLIB fires alongside after a
-// short head-start — first source to yield lyrics wins. onProg(p) reports import status.
-function fetchGeniusLyrics(url, cb, onProg){
-  if(!/^https?:\/\//i.test(url)){ cb('invalid url', null); return; }
-  var enc=encodeURIComponent(url);
-  var sources=[
-    { u:'https://proxy.corsfix.com/?'+url,              json:false },
-    { u:'https://corsproxy.io/?url='+enc,               json:false },
-    { u:'https://api.allorigins.win/raw?url='+enc,      json:false },
-    { u:'https://api.codetabs.com/v1/proxy?quest='+enc, json:false },
-    { u:'https://thingproxy.freeboard.io/fetch/'+url,   json:false },
-    { u:'https://api.allorigins.win/get?url='+enc,      json:true  }
-  ];
-  if(IN_AE) sources.unshift({ u:url, json:false });   // AE: direct, no web security
-  var done=false, pending=sources.length, tried=0, total=sources.length;
-  function report(stage){ if(onProg){ try{ onProg({stage:stage, done:tried, total:total}); }catch(e){} } }
-  report('start');
-  function finishNow(lyr, err){ if(done) return; done=true; if(lyr) report('done'); cb(lyr?null:(err||'no lyrics found'), lyr||null); }
-  // ALL page sources failed → no-proxy fallbacks: AE downloads the real page with the
-  // system curl; then LRCLIB (open lyrics API with CORS) searched by the URL slug.
-  function fallback(){
-    report('deep');
-    _aeCurlFetch(url, function(html){
-      var lyr=html?parseGeniusHTML(html):null;
-      if(lyr){ finishNow(lyr); return; }
-      _lrclibFetch(url, function(t){ finishNow(t||null, t?null:'no lyrics found'); });
-    });
-  }
-  function finish(err, lyr){
-    if(done) return;
-    tried++;
-    if(lyr){ finishNow(lyr); }   // proxy de Genius (con secciones) gana de inmediato
-    else{ report('progress'); if(--pending<=0){ fallback(); } }
-  }
-  sources.forEach(function(s){
-    var settled=false; function settle(err, lyr){ if(settled||done) return; settled=true; finish(err, lyr); }
-    var ctrl = window.AbortController ? new AbortController() : null;
-    var to=setTimeout(function(){ if(ctrl){ try{ ctrl.abort(); }catch(e){} } settle('timeout', null); }, 5500);
-    fetch(s.u, ctrl ? { signal:ctrl.signal } : undefined)
-      .then(function(r){ return r.text(); })
-      .then(function(txt){
-        clearTimeout(to);
-        if(s.json){ try{ var j=JSON.parse(txt); txt=j.contents||j.html||''; }catch(e){ txt=''; } }
-        var lyr = txt ? parseGeniusHTML(txt) : null;
-        settle(lyr ? null : 'no lyrics', lyr);
-      })
-      .catch(function(){ clearTimeout(to); settle('network error', null); });
-  });
-  // LRCLIB ya NO corre en paralelo: solo dentro de fallback() como ULTIMO recurso, para
-  // no pisar a Genius/curl que sí traen los separadores [Chorus]/[Verse].
+
+// ─── GENIUS FETCH ENGINE ───
+// UNA peticion = UN link. Nada se comparte entre peticiones (en AE cada descarga con curl
+// usa su PROPIO archivo temporal) y cada resultado se verifica contra la URL canonica de
+// su link → cada canal recibe SIEMPRE la letra de SU link, en el orden de los links.
+// Rutas (gana la primera letra verificada):
+//  · embed  — genius.com/songs/<id>/embed.js: CORS abierto (*), ~6 KB, trae las [Secciones].
+//             El <id> sale de la API de busqueda (match EXACTO del link) y queda en cache.
+//  · pagina — HTML de Genius: directo en AE; via proxies CORS en web (los proxies gratis
+//             fallan seguido — ya no son la unica via, y se piden datos chicos primero).
+//  · curl   — solo AE: curl del sistema, en cola (uno a la vez), archivo temporal unico.
+//  · LRCLIB — ultimo recurso (sin [Secciones]) y solo si coincide artista+titulo del link.
+// Si nada responde, se reintenta una vez (los proxies se recuperan de rate-limits).
+// OPCIONAL — web 100% confiable: token GRATIS de la API oficial de Genius (tiene CORS
+// abierto). En https://genius.com/api-clients crea un "API Client" y pulsa "Generate
+// Access Token"; pega aqui el "Client Access Token" (o en la consola del navegador:
+// localStorage.setItem('verso_genius_token','<token>')). Con el token, cada link se
+// resuelve a su id sin proxies y la letra sale del embed. Sin token todo sigue igual.
+var GENIUS_API_TOKEN='';
+function _gToken(){ if(GENIUS_API_TOKEN) return GENIUS_API_TOKEN; try{ return localStorage.getItem('verso_genius_token')||''; }catch(e){ return ''; } }
+var _G_PROXIES=[
+  { n:'corsfix',         w:function(u){ return 'https://proxy.corsfix.com/?'+u; } },   // localhost / dominio registrado
+  { n:'allorigins',      w:function(u){ return 'https://api.allorigins.win/raw?url='+encodeURIComponent(u); } },
+  { n:'codetabs',        w:function(u){ return 'https://api.codetabs.com/v1/proxy?quest='+encodeURIComponent(u); } },
+  { n:'corslol',         w:function(u){ return 'https://api.cors.lol/?url='+encodeURIComponent(u); } },
+  { n:'allorigins-json', w:function(u){ return 'https://api.allorigins.win/get?url='+encodeURIComponent(u); }, json:true }
+];
+var _gMem={};   // link normalizado -> {lyr, src}: letras verificadas de esta sesion
+var _gIds={};   // link normalizado -> id de la cancion en Genius (persistente: la proxima vez va directo al embed)
+try{ _gIds=JSON.parse(localStorage.getItem('verso_genius_ids')||'{}')||{}; }catch(e){ _gIds={}; }
+function _gRememberId(k, id){
+  id=parseInt(id,10); if(!k||!(id>0)||_gIds[k]===id) return;
+  _gIds[k]=id;
+  try{ var ks=Object.keys(_gIds); while(ks.length>500) delete _gIds[ks.shift()]; localStorage.setItem('verso_genius_ids', JSON.stringify(_gIds)); }catch(e){}
 }
-// Fallback #1 (AE only): download the Genius page with the SYSTEM curl (Windows 10+
-// ships it) via ExtendScript — real TLS + browser UA, immune to CEP CORS/Cloudflare.
-// The panel then reads the temp file (cep.fs) and parses it like any other source.
-function _aeCurlFetch(url, cb){
-  if(!IN_AE||!csInterface||!window.cep||!window.cep.fs){ cb(null); return; }
-  ensureHost(function(ok){
-    if(!ok){ cb(null); return; }
-    csInterface.evalScript('(typeof fetchGeniusToTemp==="function")?"1":"0"', function(has){
-      function go(){
-        csInterface.evalScript('fetchGeniusToTemp('+JSON.stringify(url)+')', function(r){
-          if(!r||r.indexOf('ok:')!==0){ cb(null); return; }
-          try{
-            var res=window.cep.fs.readFile(r.slice(3), window.cep.encoding.UTF8);
-            cb(res&&res.err===0?res.data:null);
-          }catch(e){ cb(null); }
-        });
-      }
-      if(has==='1'){ go(); } else { _hostSrc=null; loadHostViaXHR(go); }
+// Salud de cada proxy (no perder tiempo en uno caido): 2 fallas seguidas = 60 s en pausa
+// (el reintento la ignora: timeouts/429 suelen ser pasajeros); 400/401/403 = pide cuenta,
+// API key u origen registrado → 10 min fuera, ni siquiera en el reintento.
+var _gHealth={};
+function _gUp(n, force){ var h=_gHealth[n], now=Date.now(); return !h || (now>=h.dead && (force || now>=h.until)); }
+function _gMark(n, ok, err){
+  var h=_gHealth[n]||(_gHealth[n]={fail:0, until:0, dead:0});
+  if(ok){ h.fail=0; h.until=0; h.dead=0; return; }
+  if(/^HTTP 40[013]$/.test(err||'')){ h.dead=Date.now()+600000; return; }
+  if(++h.fail>=2){ h.fail=0; h.until=Date.now()+60000; }
+}
+// "https://www.Genius.com/Bad-bunny-dtmf-lyrics?x#y" → "genius.com/bad-bunny-dtmf-lyrics"
+function _gNorm(u){
+  u=String(u||'').trim(); try{ u=decodeURIComponent(u); }catch(e){}
+  return u.replace(/^[a-z]+:\/\//i,'').replace(/^(?:www|m)\./i,'').replace(/[?#].*$/,'').replace(/\/amp\//i,'/').replace(/\/+$/,'').toLowerCase();
+}
+function _gIsGenius(u){ return /^https?:\/\/(?:www\.|m\.)?genius\.com\/\S+/i.test(String(u||'')); }
+// El link dentro de lo pegado ("1. Artista - Cancion https://genius.com/…" → solo la URL).
+function _gLinkOf(s){ s=String(s||'').trim(); var m=s.match(/https?:\/\/[^\s"'<>]+/i); return m?m[0]:s; }
+// Palabras de busqueda desde el slug del link: ".../Bad-bunny-dtmf-lyrics" → "Bad bunny dtmf"
+function _gQuery(u){
+  var m=String(u||'').match(/genius\.com\/(?:amp\/)?([^?#\s]+)/i), s=m?m[1]:'';
+  try{ s=decodeURIComponent(s); }catch(e){}
+  return s.replace(/\/+$/,'').replace(/-(?:lyrics|annotated)$/i,'').replace(/[-_\/]+/g,' ').replace(/\s+/g,' ').trim();
+}
+function _gCanon(html){
+  html=String(html||'');
+  var m=/<link\b[^>]*\brel=["']?canonical["']?[^>]*>/i.exec(html), h=m&&/\bhref=["']([^"']+)["']/i.exec(m[0]);
+  if(h) return h[1];
+  m=/<meta\b[^>]*\bproperty=["']og:url["'][^>]*>/i.exec(html); h=m&&/\bcontent=["']([^"']+)["']/i.exec(m[0]);
+  return h?h[1]:'';
+}
+// 'ok' = es la pagina del link · 'redirect' = Genius redirigio el link a su slug actual ·
+// 'other' = otra URL sin redireccion confirmada → solo se usa si ninguna ruta trae algo mejor.
+function _gVerify(canon, key, finalUrl){
+  if(!canon) return 'ok';
+  var c=_gNorm(canon);
+  if(c===key) return 'ok';
+  if(finalUrl && _gNorm(finalUrl)===c) return 'redirect';
+  return 'other';
+}
+function _gIdFromHtml(html){ html=String(html||''); var m=/genius:\/\/songs\/(\d+)/.exec(html)||/"song_id"\s*:\s*(\d+)/.exec(html); return m?parseInt(m[1],10):0; }
+// Busca en la respuesta de busqueda (genius.com/api/search/song o api.genius.com/search)
+// el resultado cuya URL es EXACTAMENTE el link.
+// → {id, n}: id (0 si no esta) y cuantos resultados trajo (10 = puede haber otra pagina).
+function _gPickId(j, key){
+  var resp=(j&&j.response)||{}, secs=resp.sections||[{ hits:resp.hits||[] }], i, k, hits, r, n=0;
+  for(i=0;i<secs.length;i++){ hits=(secs[i]&&secs[i].hits)||[]; n+=hits.length; for(k=0;k<hits.length;k++){ r=hits[k]&&hits[k].result; if(r&&r.id&&r.url&&_gNorm(r.url)===key) return { id:r.id, n:n }; } }
+  return { id:0, n:n };
+}
+// GET con tiempo limite. cb(err, texto, urlFinal) se llama UNA sola vez. Devuelve {abort}.
+function _gGet(u, ms, cb){
+  var fin=false, ctrl=window.AbortController?new window.AbortController():null;
+  function end(err, t, fu){ if(fin) return; fin=true; clearTimeout(to); cb(err, t||'', fu||''); }
+  var to=setTimeout(function(){ if(ctrl){ try{ ctrl.abort(); }catch(e){} } end('timeout'); }, ms);
+  try{
+    fetch(u, ctrl?{ signal:ctrl.signal }:undefined)
+      .then(function(r){ var fu=r.url||''; return r.text().then(function(t){ end(r.ok?null:('HTTP '+r.status), t, fu); }); })
+      .catch(function(){ end('network error'); });
+  }catch(e){ end('network error'); }
+  return { abort:function(){ if(fin) return; fin=true; clearTimeout(to); if(ctrl){ try{ ctrl.abort(); }catch(e){} } } };
+}
+// embed.js = document.write(JSON.parse('<HTML del embed como literal JS>')) → {lyr, canon}
+function _gUnescapeJS(s){
+  return String(s).replace(/\\(u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|[\s\S])/g, function(m, c){
+    if(c.length>1) return String.fromCharCode(parseInt(c.slice(1),16));
+    return c==='n'?'\n':c==='r'?'\r':c==='t'?'\t':c==='b'?'\b':c==='f'?'\f':c==='v'?'\v':c==='0'?'\0':(c==='\n'||c==='\r')?'':c;
+  });
+}
+function _gParseEmbed(js){
+  var m=/JSON\.parse\('((?:[^'\\]|\\[\s\S])*)'\)/.exec(String(js||'')); if(!m) return null;
+  var html=''; try{ html=String(JSON.parse(_gUnescapeJS(m[1]))||''); }catch(e){ return null; }
+  // Los saltos de la letra son <br>; los \n literales del HTML del embed son solo formato.
+  html=html.replace(/<br\s*\/?>\s*/gi,'<br>').replace(/\s*\n\s*/g,' ');
+  var doc=new DOMParser().parseFromString(html, 'text/html');
+  var body=doc.querySelector('.rg_embed_body'); if(!body) return null;
+  var a=doc.querySelector('a.rg_embed_logo[href]')||doc.querySelector('.rg_embed_footer a[href]');
+  var t=_cleanGeniusText(_geniusNodeText(body));
+  return t ? { lyr:t, canon:a?a.getAttribute('href'):'' } : null;
+}
+// AE: descarga la pagina con el curl del SISTEMA (via host.jsx) — TLS real + UA de navegador,
+// inmune a CORS/Cloudflare del CEF. UNA descarga a la vez y cada una a SU archivo temporal:
+// antes todas escribian verso_genius.html y, en Mac, los callbacks de evalScript llegaban
+// cuando la cola ya habia terminado → todos los canales leian el ultimo archivo (misma letra).
+var _gCurlQ=[], _gCurlBusy=false, _gCurlHostAt=0, _gCurlSeq=0;
+function _aeCurlFetch(url, cb){   // cb(html|null, urlFinal) · devuelve {abort} (lo saca de la cola)
+  var job={ url:url, cb:cb, dead:false };
+  if(!IN_AE||!csInterface||!window.cep||!window.cep.fs){ setTimeout(function(){ cb(null, ''); }, 0); return { abort:function(){} }; }
+  _gCurlQ.push(job); _gCurlPump();
+  return { abort:function(){ job.dead=true; } };
+}
+function _gCurlPump(){
+  if(_gCurlBusy) return;
+  var job=null; while(_gCurlQ.length && !job){ var j=_gCurlQ.shift(); if(!j.dead) job=j; }
+  if(!job) return;
+  _gCurlBusy=true;
+  var fired=false, safety=setTimeout(function(){ out(null, ''); }, 30000);   // si AE nunca contesta, la cola sigue
+  function out(html, fu){ if(fired) return; fired=true; clearTimeout(safety); _gCurlBusy=false; if(!job.dead){ try{ job.cb(html||null, fu||''); }catch(e){} } _gCurlPump(); }
+  _gCurlHostReady(function(ok){
+    if(!ok){ out(null, ''); return; }
+    var tag=Date.now()+'_'+(++_gCurlSeq)+'_'+Math.floor(Math.random()*1e6);
+    csInterface.evalScript('fetchGeniusToFile('+JSON.stringify(job.url)+','+JSON.stringify(tag)+')', function(r){
+      r=String(r||'');
+      if(r.indexOf('ok:')!==0){ if(r.indexOf('EvalScript error')===0) _gCurlHostAt=0; out(null, ''); return; }
+      var nl=r.indexOf('\n'), path=nl>=0?r.slice(3,nl):r.slice(3), fu=nl>=0?r.slice(nl+1):'', html=null;
+      try{ var res=window.cep.fs.readFile(path, window.cep.encoding.UTF8); if(res&&res.err===0) html=res.data; }catch(e){}
+      try{ if(window.cep.fs.deleteFile) window.cep.fs.deleteFile(path); }catch(e){}
+      out(html, fu);
     });
   });
 }
-// Fallback #2 (web + AE): LRCLIB, an open lyrics API with permissive CORS (no proxy,
-// no key). Searches "artist song" derived from the genius URL slug.
+// host.jsx con fetchGeniusToFile cargado? Se verifica con un typeof barato (antes se recargaba
+// el host.jsx completo por CADA cancion) y solo si falta se recarga con ensureHost.
+function _gCurlHostReady(cb){
+  if(Date.now()-_gCurlHostAt<120000){ cb(true); return; }
+  csInterface.evalScript('(typeof fetchGeniusToFile==="function")?"1":"0"', function(has){
+    if(has==='1'){ _gCurlHostAt=Date.now(); cb(true); return; }
+    ensureHost(function(){
+      csInterface.evalScript('(typeof fetchGeniusToFile==="function")?"1":"0"', function(h2){ if(h2==='1') _gCurlHostAt=Date.now(); cb(h2==='1'); });
+    });
+  });
+}
+// Ultimo recurso (web + AE): LRCLIB (API abierta con CORS) buscando "artista titulo" del slug.
+// Solo acepta un resultado cuyo artista+titulo cubra el slug (>=75% de sus palabras):
+// antes tomaba el PRIMER resultado y podia meter la letra de otra cancion.
+function _gTokens(s){
+  s=String(s||'').toLowerCase(); try{ s=s.normalize('NFD').replace(/[\u0300-\u036F]/g,''); }catch(e){}
+  var stop={ and:1, feat:1, ft:1, featuring:1, with:1, x:1, y:1, lyrics:1 }, out=[], w=s.split(/[^a-z0-9]+/);
+  for(var i=0;i<w.length;i++){ if(w[i] && !stop[w[i]]) out.push(w[i]); }
+  return out;
+}
 function _lrclibFetch(url, cb){
-  var m=url.match(/genius\.com\/([^\/?#]+?)(?:-lyrics)?(?:[\/?#]|$)/i);
-  var q=m?m[1].replace(/-+/g,' ').replace(/\s+/g,' ').trim():'';
-  if(!q){ cb(null); return; }
-  var ctrl=window.AbortController?new AbortController():null;
-  var to=setTimeout(function(){ if(ctrl){ try{ ctrl.abort(); }catch(e){} } }, 5000);
-  fetch('https://lrclib.net/api/search?q='+encodeURIComponent(q), ctrl?{signal:ctrl.signal}:undefined)
-    .then(function(r){ return r.json(); })
-    .then(function(list){
-      clearTimeout(to);
-      var best=null;
-      for(var i=0;i<(list||[]).length;i++){ var it=list[i]; if(it&&it.plainLyrics){ best=it; break; } }
-      cb(best?_cleanGeniusText(best.plainLyrics):null);
-    })
-    .catch(function(){ clearTimeout(to); cb(null); });
+  var want=_gTokens(_gQuery(url));
+  if(!want.length){ setTimeout(function(){ cb(null); }, 0); return { abort:function(){} }; }
+  // Sin conectores ("and", "feat"…): LRCLIB devuelve 0 resultados si la busqueda los incluye.
+  return _gGet('https://lrclib.net/api/search?q='+encodeURIComponent(want.join(' ')), 8000, function(err, txt){
+    var list=null; if(!err){ try{ list=JSON.parse(txt); }catch(e){} }
+    var best=null, bestSc=0, bestExtra=1e9, i, k;
+    for(i=0;i<((list&&list.length)||0);i++){
+      var it=list[i]; if(!it||!it.plainLyrics) continue;
+      var have=_gTokens((it.artistName||'')+' '+(it.trackName||'')), hs={}, hit=0;
+      for(k=0;k<have.length;k++) hs[have[k]]=1;
+      for(k=0;k<want.length;k++) if(hs[want[k]]) hit++;
+      var sc=hit/want.length, extra=have.length-hit;   // empate → el titulo mas limpio (sin "Official Video"…)
+      if(sc>bestSc || (sc===bestSc && extra<bestExtra)){ bestSc=sc; bestExtra=extra; best=it; }
+    }
+    cb(best&&bestSc>=0.75?_cleanGeniusText(best.plainLyrics):null);
+  });
 }
-// Parse Genius HTML reliably via the DOM (handles nested spans/links + <br>).
+// cb(err, letra, fuente) · fuente: 'embed' | 'page' | 'curl' | 'lrclib'. onProg(p) = estado.
+function fetchGeniusLyrics(url, cb, onProg){
+  url=String(url||'').trim();
+  if(!/^https?:\/\//i.test(url)){ cb('invalid url', null); return; }
+  var key=_gNorm(url), isG=_gIsGenius(url);
+  if(_gMem[key]){ var mc=_gMem[key]; setTimeout(function(){ if(onProg){ try{ onProg({stage:'done', done:1, total:1}); }catch(e){} } cb(null, mc.lyr, mc.src); }, 0); return; }
+  var S={ over:false, cand:null, live:[], timers:[], tried:0, total:0, round:1, notFound:false };
+  function prog(stage){ if(onProg){ try{ onProg({stage:stage, done:S.tried, total:Math.max(1,S.total)}); }catch(e){} } }
+  function stopAll(){ var i; for(i=0;i<S.timers.length;i++) clearTimeout(S.timers[i]); for(i=0;i<S.live.length;i++){ try{ S.live[i].abort(); }catch(e){} } S.timers=[]; S.live=[]; }
+  function win(lyr, src, keep){ if(S.over) return; S.over=true; stopAll(); if(keep) _gMem[key]={lyr:lyr, src:src}; prog('done'); cb(null, lyr, src); }
+  function lose(err){ if(S.over) return; S.over=true; stopAll(); cb(err||'no lyrics found', null); }
+  function offer(lyr, src, verdict){
+    if(!lyr||S.over) return false;
+    if(verdict==='other'){ if(!S.cand) S.cand={ lyr:lyr, src:src }; return false; }   // no es el link exacto: solo si nada mejor aparece
+    win(lyr, src, true); return true;
+  }
+  function tEmbed(id){ return { delay:0, run:function(done){
+    S.live.push(_gGet('https://genius.com/songs/'+id+'/embed.js', 9000, function(err, txt){
+      if(S.over) return;
+      var e=(!err&&txt)?_gParseEmbed(txt):null;
+      if(e && offer(e.lyr, 'embed', 'ok')) return;   // id = match exacto del link (busqueda o cache)
+      done();
+    }));
+  }}; }
+  function tSearch(px, delay, force){ return { delay:delay, run:function(done){
+    if(px && !_gUp(px.n, force)){ done(); return; }
+    var q=encodeURIComponent(_gQuery(url));
+    (function page(pg){
+      var su='https://genius.com/api/search/song?per_page=10&page='+pg+'&q='+q;
+      S.live.push(_gGet(px?px.w(su):su, px?7000:8000, function(err, txt){
+        if(S.over) return;
+        var j=null; if(!err){ try{ j=JSON.parse(txt); if(px&&px.json) j=JSON.parse(j.contents||'null'); }catch(e){ j=null; } }
+        if(px) _gMark(px.n, !!(j&&j.response), err);
+        var r=j?_gPickId(j, key):{ id:0, n:0 };
+        if(!r.id){ if(pg===1 && r.n>=10){ page(2); return; } done(); return; }   // no esta en la 1a pagina → 2a
+        _gRememberId(key, r.id);
+        tEmbed(r.id).run(done);
+      }));
+    })(1);
+  }}; }
+  function tApi(tok){ return { delay:0, run:function(done){   // API oficial (token opcional): CORS abierto, sin proxy
+    S.live.push(_gGet('https://api.genius.com/search?per_page=20&q='+encodeURIComponent(_gQuery(url))+'&access_token='+encodeURIComponent(tok), 8000, function(err, txt){
+      if(S.over) return;
+      var j=null; if(!err){ try{ j=JSON.parse(txt); }catch(e){} }
+      var r=j?_gPickId(j, key):{ id:0 };
+      if(!r.id){ done(); return; }
+      _gRememberId(key, r.id);
+      tEmbed(r.id).run(done);
+    }));
+  }}; }
+  function tPage(px, delay, force){ return { delay:delay, run:function(done){
+    if(px && !_gUp(px.n, force)){ done(); return; }
+    S.live.push(_gGet(px?px.w(url):url, 10000, function(err, txt, fu){
+      if(S.over) return;
+      if(!px && err==='HTTP 404') S.notFound=true;
+      if(!err && px && px.json){ try{ txt=JSON.parse(txt).contents||''; }catch(e){ txt=''; } }
+      if(px) fu='';                                     // la URL final seria la del proxy, no la de Genius
+      var lyr=(!err&&txt)?parseGeniusHTML(txt):null;
+      if(px) _gMark(px.n, !!lyr, err);
+      if(lyr){ var v=_gVerify(_gCanon(txt), key, fu), id=_gIdFromHtml(txt); if(id&&v!=='other') _gRememberId(key, id); if(offer(lyr, 'page', v)) return; }
+      done();
+    }));
+  }}; }
+  function tCurl(){ return { delay:0, run:function(done){
+    S.live.push(_aeCurlFetch(url, function(html, fu){
+      if(S.over) return;
+      var lyr=html?parseGeniusHTML(html):null;
+      if(lyr){ var v=_gVerify(_gCanon(html), key, fu), id=_gIdFromHtml(html); if(id&&v!=='other') _gRememberId(key, id); if(offer(lyr, 'curl', v)) return; }
+      done();
+    }));
+  }}; }
+  // Niveles: si TODO un nivel falla (o pasa su "wait" sin ganador) arranca el siguiente.
+  //  AE:  [embed cacheado + API con token + pagina directa + busqueda directa] → [curl] → [proxies]
+  //  web: [embed cacheado + API con token] → [proxies: busquedas (livianas) y luego paginas]
+  function plan(force){
+    var A=[], B=[], C=[], d=0, i, cid=_gIds[key], tok=isG?_gToken():'';
+    if(cid) A.push(tEmbed(cid));
+    if(tok) A.push(tApi(tok));
+    if(IN_AE){ A.push(tPage(null, 0, force)); if(isG) A.push(tSearch(null, 200, force)); B.push(tCurl()); }
+    if(isG) for(i=0;i<_G_PROXIES.length;i++){ C.push(tSearch(_G_PROXIES[i], d, force)); d+=300; }
+    for(i=0;i<_G_PROXIES.length;i++){ C.push(tPage(_G_PROXIES[i], d, force)); d+=400; }
+    return [ { tasks:A, wait:IN_AE?6000:3500 }, { tasks:B, wait:9000, stage:'deep' }, { tasks:C, wait:0, stage:IN_AE?'deep':'' } ];
+  }
+  function runRound(){
+    var T=plan(S.round>1), ti=0, out=0, allIn=false;
+    for(var k=0;k<T.length;k++) S.total+=T[k].tasks.length;   // total del intento desde el inicio → progreso sin saltos atras
+    function check(){ if(!S.over && allIn && out<=0) endRound(); }
+    function launch(){
+      if(S.over) return;
+      if(ti>=T.length){ allIn=true; check(); return; }
+      var tier=T[ti++], left=tier.tasks.length, moved=false;
+      function adv(){ if(moved) return; moved=true; launch(); }
+      if(!left){ adv(); return; }
+      out+=left; if(tier.stage) prog(tier.stage);
+      if(tier.wait) S.timers.push(setTimeout(adv, tier.wait));
+      tier.tasks.forEach(function(t){
+        S.timers.push(setTimeout(function(){
+          if(S.over) return;
+          var called=false;
+          t.run(function(){ if(called) return; called=true; S.tried++; out--; if(S.over) return; prog('progress'); if(--left<=0) adv(); check(); });
+        }, t.delay||0));
+      });
+    }
+    launch();
+  }
+  function endRound(){
+    if(S.over) return;
+    if(S.cand){ win(S.cand.lyr, S.cand.src, false); return; }
+    if(S.notFound){ lose('link not found on Genius (404)'); return; }
+    if(S.round<2){ S.round++; prog('retry'); S.timers.push(setTimeout(runRound, 1200)); return; }
+    if(!isG){ lose('no lyrics found'); return; }
+    prog('lrclib');
+    S.live.push(_lrclibFetch(url, function(t){ if(S.over) return; if(t) win(t, 'lrclib', false); else lose('no lyrics found'); }));
+  }
+  prog('start');
+  runRound();
+}
+// Texto de un nodo de letra: <br> = salto de linea. Fuera el encabezado de Genius
+// (contribuidores / traducciones / descripcion "Read More") y los anuncios que van DENTRO
+// del contenedor de la letra (Genius los marca con data-exclude-from-selection).
 function _geniusNodeText(el){
-  var clone=el.cloneNode(true);
+  var clone=el.cloneNode(true), doc=clone.ownerDocument||document, i;
+  var ex=clone.querySelectorAll('[data-exclude-from-selection="true"]');
+  for(i=0;i<ex.length;i++){ if(ex[i].parentNode) ex[i].parentNode.removeChild(ex[i]); }
   var brs=clone.querySelectorAll('br');
-  for(var i=0;i<brs.length;i++){ brs[i].parentNode.replaceChild(document.createTextNode('\n'), brs[i]); }
+  for(i=0;i<brs.length;i++){ if(brs[i].parentNode) brs[i].parentNode.replaceChild(doc.createTextNode('\n'), brs[i]); }
   return clone.textContent||'';
 }
+// Marcas de agua de Genius en la letra de la pagina: letras cirilicas/griegas identicas a
+// las latinas ("е" U+0435 en vez de "e") y espacios raros (U+2005, U+205F…). En AE salen
+// con otra fuente o como glifo faltante → se pasan a sus equivalentes normales. Solo en
+// palabras que YA tienen letras latinas: una letra realmente en ruso/griego no se toca.
+var _G_HOMO={'\u0430':'a','\u0435':'e','\u043E':'o','\u0440':'p','\u0441':'c','\u0443':'y','\u0445':'x','\u0456':'i','\u0458':'j','\u0455':'s','\u0501':'d','\u051B':'q','\u051D':'w','\u04BB':'h','\u04CF':'l',
+  '\u0410':'A','\u0412':'B','\u0415':'E','\u041A':'K','\u041C':'M','\u041D':'H','\u041E':'O','\u0420':'P','\u0421':'C','\u0422':'T','\u0425':'X','\u0423':'Y','\u0406':'I','\u0408':'J','\u0405':'S','\u051A':'Q','\u051C':'W',
+  '\u03BF':'o','\u03BD':'v','\u03C1':'p','\u0391':'A','\u0392':'B','\u0395':'E','\u0396':'Z','\u0397':'H','\u0399':'I','\u039A':'K','\u039C':'M','\u039D':'N','\u039F':'O','\u03A1':'P','\u03A4':'T','\u03A5':'Y','\u03A7':'X'};
+function _gTidy(t){
+  return String(t||'')
+    .replace(/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g,' ')
+    .replace(/[\u200B-\u200D\u2060\uFEFF]/g,'')
+    .replace(/[^\s]+/g, function(w){
+      if(!/[\u0370-\u03FF\u0400-\u04FF\u0500-\u052F]/.test(w) || !/[A-Za-z\u00C0-\u024F]/.test(w)) return w;
+      return w.replace(/[\u0370-\u03FF\u0400-\u04FF\u0500-\u052F]/g, function(c){ return _G_HOMO[c]||c; });
+    });
+}
 function _cleanGeniusText(t){
+  t=_gTidy(String(t||'').replace(/\r\n?/g,'\n'));
+  // Descripcion de Genius ("… Read More") ANTES de la primera [Seccion] → fuera. Solo antes
+  // de la primera seccion: nunca recorta una letra que diga "Read More".
+  var sec=t.search(/\[[^\]\n]{1,60}\]/), rm=t.indexOf('Read More');
+  if(rm>=0 && (sec<0 || rm<sec)) t=t.slice(rm+9);
+  // Respaldo: encabezado "N Contributors · Translations · <Titulo> Lyrics" sin descripcion.
+  t=t.replace(/^\s*\d+\s*Contributors?[\s\S]*?Lyrics\s*/, function(m){ return /\[[^\]\n]{1,60}\]/.test(m)?m:''; });
   return t
-          // Strip Genius' leading song-description block (ends with "Read More"), which sits
-          // between the title and the first [section] — covers contributors/translations too.
-          .replace(/^[\s\S]*?Read More\s*/,'')
-          // Fallback header strip: "N Contributors · Translations · <Title> Lyrics" (no description)
-          .replace(/^\s*\d+\s*Contributor(?:s)?[\s\S]*?Lyrics\s*/,'')
-          // Strip trailing "…Embed" counter Genius appends after the last line
-          .replace(/\d*Embed\s*$/,'')
+          .replace(/\d*Embed\s*$/,'')                                 // contador "…Embed" final
           .replace(/\[[^\]\n]{0,60}\]/g,function(m){return '\n'+m+'\n';})
-          .replace(/\n{3,}/g,'\n\n').replace(/[ \t]+\n/g,'\n').replace(/^\s+|\s+$/g,'');
+          .replace(/[ \t]+\n/g,'\n').replace(/\n[ \t]+/g,'\n')
+          .replace(/\n{3,}/g,'\n\n').replace(/^\s+|\s+$/g,'');
 }
 function parseGeniusHTML(html){
   if(!html) return null;

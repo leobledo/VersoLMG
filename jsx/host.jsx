@@ -13,7 +13,7 @@ function _isWin() { try { return String($.os).indexOf("Windows") !== -1; } catch
 function _dlgFilter(winFilter, exts) { return _isWin() ? winFilter : undefined; }
 // Sentinela de version del host: el panel comprueba que ESTA funcion exista para saber
 // si AE tiene cargada una copia vieja del jsx y forzar su recarga.
-function _hostVersion() { return 'verso-2025-06'; }
+function _hostVersion() { return 'verso-2026-10'; }
 function _AUDIO_FILTER() { return _dlgFilter('Audio:*.mp3,*.wav,*.aac,*.aif,*.aiff,*.ogg,*.m4a,*.flac,*.wma,*.caf', ["mp3","wav","aac","aif","aiff","ogg","m4a","flac","wma","caf"]); }
 function _SRT_FILTER()   { return _dlgFilter('SRT:*.srt,All files:*', ["srt","txt"]); }
 function saveSRTFile(srtContent, suggestedName) {
@@ -2115,20 +2115,30 @@ function importLyricsToMany(namesJSON, srtContent, optionsJSON) {
   return okc ? ('ok:' + parts.join('  ·  ')) : ('err:' + parts.join('  ·  '));
 }
 
-// Descarga una URL con el curl del SISTEMA (Windows 10+ lo trae) a un archivo temporal
-// y devuelve 'ok:<ruta>'. Fallback de red del panel cuando fetch/proxies fallan en CEP:
-// curl usa el TLS real de Windows + user-agent de navegador (pasa Cloudflare).
-function fetchGeniusToTemp(url) {
+// Descarga una URL con el curl del SISTEMA (Windows 10+ y macOS lo traen) a un archivo
+// temporal PROPIO de esta peticion y devuelve 'ok:<ruta>' (+ '\n<url final>' en Mac).
+// Fallback de red del panel cuando fetch/proxies fallan en CEP: curl usa el TLS real del
+// sistema + user-agent de navegador (pasa Cloudflare).
+// CADA llamada escribe a SU archivo (tag unico que manda el panel). Antes todas usaban
+// 'verso_genius.html': con varios canales en cola, en Mac los callbacks de evalScript
+// llegaban cuando la cola ya habia terminado y TODOS los canales leian el ultimo archivo
+// descargado (= la misma letra en todos los canales).
+function fetchGeniusToFile(url, tag) {
   try {
-    if (!/^https?:\/\//.test(url)) return 'err:bad url';
-    var f = new File(Folder.temp.fsName + '/verso_genius.html');
+    url = String(url || '');
+    if (!/^https?:\/\/[^\s"`$\\]+$/.test(url)) return 'err:bad url';
+    tag = String(tag || '').replace(/[^A-Za-z0-9_\-]/g, '');
+    if (!tag) tag = (new Date()).getTime() + '_' + Math.floor(Math.random() * 1000000);
+    _cleanGeniusTemp();
+    var f = new File(Folder.temp.fsName + '/verso_genius_' + tag + '.html');
     try { if (f.exists) f.remove(); } catch (e0) {}
-    var ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-    var cmd = 'curl -s -L --max-time 10 -A "' + ua + '" -o "' + f.fsName + '" "' + url + '"';
-    if ($.os.indexOf('Windows') !== -1) {
+    var eff = '';
+    if (_isWin()) {
+      var ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+      var cmd = 'curl -s -L --max-time 10 -A "' + ua + '" -o "' + f.fsName + '" "' + url + '"';
       // Ejecutar curl OCULTO: 'cmd.exe /c' abre una ventana de consola por cada llamada
       // (molesto en bulk). WScript.Shell.Run(cmd, 0, True) = ventana oculta + espera.
-      var vbs = new File(Folder.temp.fsName + '/verso_fetch.vbs');
+      var vbs = new File(Folder.temp.fsName + '/verso_fetch_' + tag + '.vbs');
       vbs.encoding = 'UTF-8';
       if (vbs.open('w')) {
         vbs.write('CreateObject("WScript.Shell").Run "cmd /c ' + cmd.replace(/"/g, '""') + '", 0, True');
@@ -2139,11 +2149,37 @@ function fetchGeniusToTemp(url) {
         system.callSystem('cmd.exe /c ' + cmd);   // si no se puede escribir el shim, modo normal
       }
     } else {
-      system.callSystem(cmd);
+      // macOS: /usr/bin/curl siempre existe (no depende del PATH de AE); --compressed baja
+      // ~5x menos datos. Con -s y -o, stdout = solo la URL final (-w): el panel la usa para
+      // aceptar redirecciones de Genius (link viejo → slug actual).
+      var bin = (new File('/usr/bin/curl')).exists ? '/usr/bin/curl' : 'curl';
+      var uaM = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+      eff = String(system.callSystem(bin + ' -s -L --compressed --max-time 12 -A "' + uaM + '"' +
+        ' -H "Accept: text/html,application/xhtml+xml" -H "Accept-Language: en-US,en;q=0.9"' +
+        ' -o "' + f.fsName + '" -w "%{url_effective}" "' + url + '"') || '').replace(/^\s+|\s+$/g, '');
+      if (!/^https?:\/\//.test(eff)) eff = '';
     }
-    if (!f.exists || f.length < 500) return 'err:curl produced no output';
-    return 'ok:' + f.fsName;
+    if (!f.exists || f.length < 500) {
+      try { if (f.exists) f.remove(); } catch (e1) {}
+      return 'err:curl produced no output';
+    }
+    return 'ok:' + f.fsName + (eff ? '\n' + eff : '');
   } catch (e) { return 'err:' + e.toString(); }
+}
+// Compatibilidad con paneles anteriores: misma descarga (archivo unico), devuelve solo la ruta.
+function fetchGeniusToTemp(url) {
+  var r = fetchGeniusToFile(url, '');
+  var nl = r.indexOf('\n');
+  return nl >= 0 ? r.substring(0, nl) : r;
+}
+// Borra descargas de Genius de mas de 10 min que el panel no alcanzo a borrar.
+function _cleanGeniusTemp() {
+  try {
+    var old = Folder.temp.getFiles('verso_genius_*.html'), now = (new Date()).getTime();
+    for (var i = 0; i < old.length; i++) {
+      try { if (old[i] instanceof File && now - old[i].modified.getTime() > 600000) old[i].remove(); } catch (e) {}
+    }
+  } catch (e2) {}
 }
 
 // Bulk (1 canal por llamada): importa la letra a su comp Lyrics SOLO si hace falta.
