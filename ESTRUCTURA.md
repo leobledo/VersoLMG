@@ -1,6 +1,6 @@
 # Verso LMG — Mapa de estructura
 
-> Referencia rápida para no tener que releer `index.html` (3030 líneas) ni
+> Referencia rápida para no tener que releer `index.html` (3079 líneas) ni
 > `jsx/host.jsx` (2532 líneas) completos en cada sesión. Actualizar esta tabla
 > cuando cambien secciones grandes o se resuelvan bugs de plataforma nuevos.
 >
@@ -11,7 +11,7 @@
 
 | Archivo | Líneas | Rol |
 |---|---|---|
-| `index.html` | ~3030 | UI + toda la lógica del panel (CSS + JS inline, un solo `<script>`) |
+| `index.html` | ~3079 | UI + toda la lógica del panel (CSS + JS inline, un solo `<script>`) |
 | `jsx/host.jsx` | ~2532 | ExtendScript (ES3) que corre dentro de AE: manipula comps/capas |
 | `CSInterface.js` | ~103 | Bridge CEP recortado a mano (NO es el oficial de Adobe — ver más abajo) |
 | `CSXS/manifest.xml` | — | Manifest de la extensión (nombre "Verso LMG") |
@@ -97,9 +97,9 @@ Secciones marcadas con `// ─── NOMBRE ───` en el código — buscar 
 | 2370 | THUMBNAIL | actualiza comps "… TH" |
 | 2403 | IMPORT MENU | |
 | 2460 | AUTO-SYNC | LRCLIB (fallback, preserva secciones de Genius) |
-| 2520 | GENIUS BULK | links por canal; `loadGenius()` (máx. 3 a la vez, link i → canal i) — ver sección Genius |
-| **2632** | **GENIUS FETCH ENGINE** | `fetchGeniusLyrics`, embed/página/curl/LRCLIB, verificación por URL canónica — ver sección Genius |
-| 3007 | UTILS | `fmtClock`, `esc`, etc. |
+| 2520 | GENIUS BULK | links por canal; `loadGenius()` (máx. 4 a la vez, link i → canal i) — ver sección Genius |
+| **2632** | **GENIUS FETCH ENGINE** | `fetchGeniusLyrics`, embed/extensión/página/curl/LRCLIB, verificación por URL canónica — ver sección Genius |
+| 3056 | UTILS | `fmtClock`, `esc`, etc. |
 
 ---
 
@@ -241,29 +241,42 @@ SIEMPRE la letra de SU link, en el orden de los links (`loadGenius` aplica por
    las [Secciones] y el texto SIN las marcas de agua de la página. El `<id>` sale
    de la API de búsqueda (`/api/search/song`, match EXACTO de la URL del link,
    página 1 y 2) o de la caché `localStorage['verso_genius_ids']`.
-2. **API oficial con token (opcional)** — `GENIUS_API_TOKEN` (o
-   `localStorage['verso_genius_token']`): `api.genius.com/search` tiene CORS, así
-   que con token la web resuelve el id sin proxies. Sin token se salta.
+2. **ext** (solo web) — extensión Chrome **Content Controler v2** (`_gExtReady`
+   ping `VERSO_EXT_PING`/`PONG`, `_gExtFetch` → `VERSO_FETCH_GENIUS`): lee la
+   pestaña de Genius ya abierta con ESE link (fuente `tab`) o descarga la página
+   sin CORS (fuente `ext`). Es la vía confiable en web.
+   Extensión: `/Volumes/Bledo Drive/Content Controler`
+   (`versions/v2-2026-10-03-verso-letras`).
 3. **página** — HTML de Genius: directo en AE; vía proxies CORS en web.
+   (`GENIUS_API_TOKEN`: ruta experimental con la API oficial; la doc dice que no
+   acepta CORS y no se probó con token real.)
 4. **curl** (solo AE) — `_aeCurlFetch`: COLA, una descarga a la vez, cada una a
    su archivo temporal; el panel lo lee con `cep.fs` y lo borra.
 5. **LRCLIB** — último recurso (sin [Secciones]); solo acepta un resultado cuyo
    artista+título cubra ≥75% de las palabras del slug. La búsqueda va SIN
    conectores ("and", "feat"…): con ellos LRCLIB devuelve 0 resultados.
 
-Niveles AE: [embed cacheado + token + página directa + búsqueda directa] →
-[curl] → [proxies]. Web: [embed cacheado + token] → [proxies]. Si todo falla se
-reintenta una vez y luego LRCLIB. `loadGenius`: máx. 3 canciones a la vez + una
-pasada final, una por una, para los links que fallen; si algo falla, la sección
-de links queda abierta con el detalle por canal y "Load" reintenta.
+Niveles AE: [embed cacheado + página directa + búsqueda directa] → [curl] →
+[proxies]. Web: [embed cacheado + extensión] → [proxies]. LRCLIB se pide EN
+PARALELO desde el inicio y solo se usa si Genius falla (no suma espera). El
+reintento (2a vuelta) solo repite vías no-proxy (AE: directa/curl; web: extensión).
+`loadGenius`: máx. 4 canciones a la vez + una pasada final, una por una, para los
+links que fallen; si algo falla, la sección de links queda abierta con el detalle
+por canal y "Load" reintenta.
 
-### Proxies web (estado medido oct-2026, origen no-localhost)
-corsfix → 403/400 (requiere dominio registrado; solo sirve en localhost) ·
-corsproxy.io → 401 (API key) · thingproxy → no existe (quitados ambos) ·
-allorigins/codetabs → intermitentes (timeouts/522/500), allorigins responde
-mejor a la búsqueda JSON (13 KB) que a la página (400–700 KB). Por eso la
-salud de cada proxy se rastrea (`_gHealth`) y la web solo es 100% confiable
-con el token oficial.
+### Proxies web (medido 3-oct-2026 desde https://leobledo.github.io)
+**Ninguno responde**: corsfix → 403 (dominio no registrado; gratis solo en
+localhost) · corsproxy.io → 401 (API key) · allorigins/codetabs → sin respuesta ·
+cors.lol, corsproxy.org, cors.eu.org, jsonp.afeld.me, whateverorigin,
+everyorigin, test.cors.workers.dev → bloqueados · r.jina.ai → 403 · noembed →
+no soporta Genius. La página de Genius directa está bloqueada por CORS; SÍ
+responden el embed por id y LRCLIB. `_gHealth`: un proxy que falla (sin éxito
+previo) queda 2 min fuera. Por eso la web confiable = extensión v2.
+
+Medido en Chrome real con los 11 links de una sesión real: web + extensión v2
+11/11 desde Genius en 0.5–2.5 s · web sin extensión 11/11 vía LRCLIB en 12 s ·
+AE (CEF sin seguridad web) 11/11 directa en 0.8 s · AE con directa bloqueada
+(curl, tiempos de Mac) 11/11 en 3.3 s.
 
 ### Limpieza de texto
 `_geniusNodeText` quita del contenedor de la letra los nodos
@@ -342,5 +355,6 @@ Verificado con 12 canciones: página y embed dan texto idéntico byte a byte.
   replicados a Verso/CM.
 - El arreglo de Genius (oct-2026) **sí** está aplicado en las 3 versiones
   (carpeta `Verso Updates`). Falta confirmarlo dentro de AE en Mac y Windows.
-- Web 100% confiable requiere el token oficial de Genius (`GENIUS_API_TOKEN`);
-  la ruta con token está implementada pero no se pudo probar con un token real.
+- Web con [secciones] requiere la extensión Content Controler v2 (pasar
+  `versions/v2-2026-10-03-verso-letras` a la raíz y recargarla). En iPad no hay
+  extensión: solo embed cacheado o LRCLIB.
